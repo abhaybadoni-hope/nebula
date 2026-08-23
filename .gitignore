@@ -1,5 +1,6 @@
 # Simulation outputs
 *.txt
+!requirements.txt
 *.log
 *.raw
 results/*.jsonl
