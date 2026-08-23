@@ -2,20 +2,26 @@
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from enum import IntEnum
 import math
 from pathlib import Path
 import tempfile
 from typing import Iterable, Mapping
 
-from .channel import filter_channel, load_s4p
+from .channel import (
+    ChannelPortMap, filter_channel, load_s4p, sampling_offset_bits,
+    sampling_reference_phase_s, validate_s4p_channel,
+)
 from .cache import EvaluationCache
 from .config import PVT_GRID, ProcessCorner, SimulationConditions, Sky130Config
 from .ctle import spice_number, validate_ctle_parameters
 from .models import FailureCode, ParameterValue, SimulationRequest, SimulationResult
 from .ngspice import NgSpiceConfig, ngspice_identity, run_simulation
-from .provenance import git_identity, sha256_file, stable_fingerprint
+from .provenance import (
+    git_identity, sha256_file, spice_dependency_fingerprint,
+    spice_dependency_manifest, stable_fingerprint,
+)
 from .receiver_metrics import (
     apply_hybrid_one_tap_dfe, choose_sampling_phase, dfe_eye_metrics,
     eye_metrics, expected_signs,
@@ -28,6 +34,7 @@ ROOT = Path(__file__).resolve().parents[1]
 BLOCK = ROOT / "circuits" / "blocks" / "ctle.spice"
 BENCHES = ROOT / "circuits" / "benches"
 SYNTHETIC_CHANNEL = ROOT / "channels" / "synthetic_regression.s4p"
+TRANSIENT_RAIL_EXCURSION_TOLERANCE_V = 10e-3
 
 DC_MEASUREMENTS = (
     "inp_dc_v", "inn_dc_v", "outp_dc_v", "outn_dc_v",
@@ -85,7 +92,7 @@ class StageResult:
     success: bool
     runtime_s: float
     measurements: dict[str, float] = field(default_factory=dict)
-    metrics: dict[str, float] = field(default_factory=dict)
+    metrics: dict[str, object] = field(default_factory=dict)
     violations: tuple[str, ...] = ()
     failure_code: str | None = None
     errors: tuple[str, ...] = ()
@@ -101,7 +108,7 @@ class ReceiverEvaluation:
     conditions: SimulationConditions
     fidelity: EvaluationFidelity
     stages: tuple[StageResult, ...]
-    metrics: dict[str, float]
+    metrics: dict[str, object]
     failed_stage: str | None
     runtime_s: float
     evaluation_id: str
@@ -187,7 +194,7 @@ def _dc_metrics(measurements: Mapping[str, float], parameters: ReceiverParameter
     if metrics["ctle_power_w"] <= 0 or metrics["ctle_power_w"] >= 15e-3:
         violations.append("Stage 1 CTLE power is outside (0, 15 mW)")
     if not 0.2 <= metrics["output_common_mode_v"] <= conditions.supply_v - 0.2:
-        warnings.append("output common mode has less than 200 mV rail headroom")
+        violations.append("output common mode has less than 200 mV rail headroom")
     if metrics["source_mismatch_v"] > 0.01:
         warnings.append("source-node mismatch exceeds 10 mV")
     return metrics, tuple(violations), tuple(warnings)
@@ -241,6 +248,8 @@ def _run_ac(parameters, conditions, model, ngspice) -> StageResult:
         violations.append("CTLE peaking is outside 3 dB to 12 dB")
     if stage.metrics["out_of_band_excess_peak_db"] > 3:
         violations.append("an out-of-band peak exceeds the intended peak by more than 3 dB")
+    if stage.metrics["response_class"] == "uncontrolled_rise":
+        violations.append("CTLE response is neither a local peak nor a controlled 2.5-to-5 GHz shelf")
     warnings = ()
     if stage.metrics["group_delay_span_s"] > 40e-12:
         warnings = ("group-delay span exceeds 0.2 UI over 100 MHz to 5 GHz",)
@@ -373,36 +382,28 @@ def _run_ctle_transient(parameters, conditions, model, ngspice) -> StageResult:
                        provenance={**result.provenance, "stimulus_checksum": stimulus.checksum})
 
 
-def _run_channel_diagnostics(channel_path: str | Path) -> StageResult:
+def _run_channel_diagnostics(channel_path: str | Path,
+                             port_map: ChannelPortMap = ChannelPortMap()) -> StageResult:
     import time
     started = time.perf_counter()
     try:
-        channel = load_s4p(channel_path)
-        numpy = require_numpy()
-        transfer = channel.differential_transfer()
-        if not math.isclose(channel.reference_ohm, 50.0, rel_tol=0.0, abs_tol=1e-6):
-            raise ValueError("Stage 1 requires a 50-ohm single-ended Touchstone reference")
-        if channel.frequency_hz[-1] < 5e9:
-            raise ValueError("channel data must extend through at least 5 GHz")
-        if not numpy.isfinite(transfer).all():
-            raise ValueError("channel transfer contains non-finite values")
-        metrics = {
-            "channel_reference_ohm": channel.reference_ohm,
-            "channel_loss_1p25ghz_db": channel.insertion_loss_db(1.25e9),
-            "channel_loss_2p5ghz_db": channel.insertion_loss_db(2.5e9),
-            "channel_loss_5ghz_db": channel.insertion_loss_db(5e9),
-        }
+        channel = load_s4p(channel_path, port_map=port_map)
+        metrics = validate_s4p_channel(channel)
         return StageResult("channel", True, time.perf_counter() - started,
-                           metrics=metrics, provenance={"channel_checksum": channel.checksum})
+                           metrics=metrics, provenance={
+                               "channel_checksum": channel.checksum,
+                               "channel_port_map": asdict(port_map),
+                           })
     except Exception as exc:
         return StageResult("channel", False, time.perf_counter() - started,
                            failure_code=FailureCode.CHANNEL_ERROR.value, errors=(str(exc),))
 
 
-def _run_transient(parameters, conditions, model, ngspice, fidelity, channel_path) -> StageResult:
+def _run_transient(parameters, conditions, model, ngspice, fidelity, channel_path,
+                   port_map: ChannelPortMap = ChannelPortMap()) -> StageResult:
     numpy = require_numpy()
     stimulus = generate_nrz(_transient_config(fidelity, conditions))
-    channel = load_s4p(channel_path)
+    channel = load_s4p(channel_path, port_map=port_map)
     channel_output = filter_channel(channel, stimulus.time_s, stimulus.differential_v)
     with tempfile.TemporaryDirectory(prefix="nebula_stimulus_") as directory:
         include_path = Path(directory) / "stimulus.inc"
@@ -429,41 +430,69 @@ def _run_transient(parameters, conditions, model, ngspice, fidelity, channel_pat
     try:
         trace = parse_wrdata(result.artifacts["WAVEFORM_OUTPUT_FILE"])
         vout = trace.column("vout_diff")
+        outp = trace.column("v(outp)")
+        outn = trace.column("v(outn)")
+        supply_current = trace.column("supply_current")
+        bulk_delay_s = max(channel.bulk_delay_s(), 0.0)
+        bulk_delay_bits = sampling_offset_bits(bulk_delay_s, stimulus.config.ui_s)
+        usable_bit_count = len(stimulus.bits) - bulk_delay_bits
+        if usable_bit_count <= stimulus.config.warmup_bits + stimulus.config.tail_bits:
+            raise ValueError("channel bulk delay leaves no valid post-warm-up measurement bits")
+        aligned_bits = stimulus.bits[:usable_bit_count]
         training_stop = stimulus.config.warmup_bits
         sampling = choose_sampling_phase(
-            trace.scale, vout, stimulus.bits, stimulus.config.ui_s,
-            0, training_stop, stimulus.config.time_step_s,
+            trace.scale, vout, aligned_bits, stimulus.config.ui_s,
+            max(1, training_stop // 2), training_stop, stimulus.config.time_step_s,
+            tap_v=parameters.dfe_tap_v,
+            start_time_s=bulk_delay_bits * stimulus.config.ui_s,
+            reference_phase_s=sampling_reference_phase_s(
+                bulk_delay_s, stimulus.config.ui_s, bulk_delay_bits,
+                stimulus.config.time_step_s,
+            ),
         )
         dfe = apply_hybrid_one_tap_dfe(
-            sampling.raw_samples_v, stimulus.bits, parameters.dfe_tap_v,
+            sampling.raw_samples_v, aligned_bits, parameters.dfe_tap_v,
             training_stop,
         )
         measurement_start = stimulus.config.warmup_bits
-        measurement_stop = stimulus.config.bit_count - stimulus.config.tail_bits
-        eye = eye_metrics(trace.scale, vout, stimulus.bits, stimulus.config.ui_s,
+        measurement_stop = usable_bit_count - stimulus.config.tail_bits
+        # Eye helpers use a zero-based waveform.  Shift the view by the
+        # integer-UI channel latency while retaining the aligned bit labels.
+        shifted_time = trace.scale - bulk_delay_bits * stimulus.config.ui_s
+        eye = eye_metrics(shifted_time, vout, aligned_bits, stimulus.config.ui_s,
                           stimulus.config.time_step_s, measurement_start, measurement_stop)
         dfe_eye = dfe_eye_metrics(
-            trace.scale, vout, stimulus.bits, stimulus.config.ui_s,
+            shifted_time, vout, aligned_bits, stimulus.config.ui_s,
             stimulus.config.time_step_s, measurement_start, measurement_stop,
             parameters.dfe_tap_v,
             training_stop=training_stop,
             locked_phase_s=sampling.phase_s,
         )
         section = slice(measurement_start, measurement_stop)
-        signs = expected_signs(stimulus.bits[section])
+        signs = expected_signs(aligned_bits[section])
         corrected = dfe.corrected_samples_v[section]
-        ones = corrected[stimulus.bits[section] == 1]
-        zeros = corrected[stimulus.bits[section] == 0]
+        valid_start_s = bulk_delay_bits * stimulus.config.ui_s + measurement_start * stimulus.config.ui_s
+        valid_stop_s = bulk_delay_bits * stimulus.config.ui_s + measurement_stop * stimulus.config.ui_s
+        valid_time = (trace.scale >= valid_start_s) & (trace.scale < valid_stop_s)
+        if not numpy.any(valid_time):
+            raise ValueError("no transient samples remain in the aligned measurement region")
         metrics = {
             **eye,
             **dfe_eye,
             "dfe_tap_v": parameters.dfe_tap_v,
-            "dfe_error_count": int(numpy.count_nonzero(dfe.decisions[section] != stimulus.bits[section])),
-            "dfe_error_rate": float(numpy.mean(dfe.decisions[section] != stimulus.bits[section])),
+            "dfe_error_count": int(numpy.count_nonzero(dfe.decisions[section] != aligned_bits[section])),
+            "dfe_error_rate": float(numpy.mean(dfe.decisions[section] != aligned_bits[section])),
             "dfe_min_margin_v": float(numpy.min(signs * corrected)),
             "sampling_phase_ui": sampling.phase_ui,
+            "channel_bulk_delay_s": bulk_delay_s,
+            "channel_bulk_delay_ui": bulk_delay_s / stimulus.config.ui_s,
+            "channel_aligned_integer_delay_bits": bulk_delay_bits,
             "channel_loss_2p5ghz_db": channel.insertion_loss_db(2.5e9),
             "simulated_bits": measurement_stop - measurement_start,
+            "transient_output_min_v": float(min(numpy.min(outp[valid_time]), numpy.min(outn[valid_time]))),
+            "transient_output_max_v": float(max(numpy.max(outp[valid_time]), numpy.max(outn[valid_time]))),
+            "transient_average_power_w": float(-numpy.mean(supply_current[valid_time]) * conditions.supply_v),
+            "transient_supply_v": conditions.supply_v,
         }
     except (KeyError, ValueError, RuntimeError) as exc:
         return StageResult("transient", False, result.runtime_s,
@@ -479,6 +508,23 @@ def _run_transient(parameters, conditions, model, ngspice, fidelity, channel_pat
 
 def _transient_violations(metrics: Mapping[str, float], fidelity: EvaluationFidelity) -> list[str]:
     violations: list[str] = []
+    if metrics["dfe_error_count"] != 0:
+        violations.append("post-warm-up deterministic DFE decisions contain bit errors")
+    if metrics["dfe_min_margin_v"] <= 0:
+        violations.append("post-warm-up DFE minimum decision margin is not positive")
+    # A resistively loaded differential pair normally lets its inactive output
+    # return close to VDD.  Proximity to the high rail is therefore not evidence
+    # of clipping.  Keep DC operating-point headroom as the saturation guard and
+    # reject only transient excursions beyond the nominal rails (with a small
+    # tolerance for interpolation and numerical integration error).
+    tolerance = TRANSIENT_RAIL_EXCURSION_TOLERANCE_V
+    if metrics["transient_output_min_v"] < -tolerance:
+        violations.append("transient output crosses below the ground rail")
+    if metrics["transient_output_max_v"] > metrics["transient_supply_v"] + tolerance:
+        violations.append("transient output crosses above the nominal maximum supply rail")
+    power = metrics["transient_average_power_w"]
+    if power <= 0 or power >= 15e-3:
+        violations.append("transient average CTLE power is outside (0, 15 mW)")
     if fidelity >= EvaluationFidelity.CANDIDATE:
         if metrics["dfe_locked_phase_eye_height_v"] <= 0.1:
             violations.append("DFE vertical eye opening at the locked phase does not exceed 100 mV")
@@ -500,6 +546,7 @@ def evaluate_receiver(
     fidelity: EvaluationFidelity = EvaluationFidelity.TRAINING,
     *,
     channel_path: str | Path = SYNTHETIC_CHANNEL,
+    channel_port_map: ChannelPortMap = ChannelPortMap(),
     sky130: Sky130Config | None = None,
     ngspice: NgSpiceConfig | None = None,
     cache: EvaluationCache | None = None,
@@ -529,21 +576,25 @@ def evaluate_receiver(
         identity = stable_fingerprint({"parameters": asdict(parameters), "conditions": conditions.to_dict()})
         return ReceiverEvaluation(False, parameters, conditions, fidelity, (stage,), {}, "setup", 0.0,
                                   identity, git_identity(ROOT))
-    try:
-        channel_checksum = sha256_file(channel_path)
-    except (FileNotFoundError, OSError) as exc:
-        stage = StageResult("setup", False, 0.0, failure_code=FailureCode.CHANNEL_ERROR.value,
-                            errors=(str(exc),))
-        identity = stable_fingerprint({"parameters": asdict(parameters), "conditions": conditions.to_dict()})
-        return ReceiverEvaluation(False, parameters, conditions, fidelity, (stage,), {}, "setup", 0.0,
-                                  identity, git_identity(ROOT))
+    channel_checksum = None
+    if fidelity >= EvaluationFidelity.TRAINING:
+        try:
+            channel_checksum = sha256_file(channel_path)
+            channel_port_map.validate()
+        except (FileNotFoundError, OSError, ValueError) as exc:
+            stage = StageResult("setup", False, 0.0, failure_code=FailureCode.CHANNEL_ERROR.value,
+                                errors=(str(exc),))
+            identity = stable_fingerprint({"parameters": asdict(parameters), "conditions": conditions.to_dict()})
+            return ReceiverEvaluation(False, parameters, conditions, fidelity, (stage,), {}, "setup", 0.0,
+                                      identity, git_identity(ROOT))
     try:
         provenance = {
             **git_identity(ROOT),
             **simulator_identity,
-            "model_library_checksum": sha256_file(model),
+            "model_library_checksum": spice_dependency_fingerprint(model),
+            "model_library_root_checksum": sha256_file(model),
+            "model_dependency_count": len(spice_dependency_manifest(model)),
             "ctle_block_checksum": sha256_file(BLOCK),
-            "channel_checksum": channel_checksum,
             "bench_checksum": stable_fingerprint({
                 path.name: sha256_file(path) for path in sorted(BENCHES.glob("*.cir"))
             }),
@@ -551,9 +602,14 @@ def evaluate_receiver(
                 name: sha256_file(Path(__file__).with_name(name))
                 for name in ("receiver.py", "receiver_metrics.py", "channel.py", "stimulus.py", "waveform.py")
             }),
-            "metric_schema_version": 1,
+            "metric_schema_version": 2,
             "stimulus_schema_version": 1,
             }
+        if channel_checksum is not None:
+            provenance.update({
+                "channel_checksum": channel_checksum,
+                "channel_port_map": asdict(channel_port_map),
+            })
     except Exception as exc:
         stage = StageResult("setup", False, 0.0, failure_code=FailureCode.INVALID_PARAMETER.value,
                             errors=(str(exc),))
@@ -564,6 +620,7 @@ def evaluate_receiver(
         "parameters": asdict(parameters), "conditions": conditions.to_dict(),
         "fidelity": fidelity.name, **provenance,
     })
+    invalid_cached_entry = False
     if cache:
         cached = cache.get(evaluation_id)
         if cached is not None:
@@ -571,19 +628,20 @@ def evaluate_receiver(
                 return ReceiverEvaluation.from_dict(cached)
             except (KeyError, TypeError, ValueError):
                 # A corrupt or obsolete entry is a miss, never a fatal evaluation error.
-                pass
+                invalid_cached_entry = True
 
     runners = [lambda: _run_dc(parameters, conditions, model, effective_ngspice),
                lambda: _run_ac(parameters, conditions, model, effective_ngspice),
                lambda: _run_ctle_transient(parameters, conditions, model, effective_ngspice)]
+    if fidelity >= EvaluationFidelity.TRAINING:
+        runners.append(lambda: _run_channel_diagnostics(channel_path, channel_port_map))
     if fidelity >= EvaluationFidelity.CANDIDATE:
         runners.extend((lambda: _run_noise(parameters, conditions, model, effective_ngspice),
                         lambda: _run_hd3(parameters, conditions, model, effective_ngspice,
                                         fidelity >= EvaluationFidelity.FINAL)))
     if fidelity >= EvaluationFidelity.TRAINING:
-        runners.append(lambda: _run_channel_diagnostics(channel_path))
         runners.append(lambda: _run_transient(parameters, conditions, model, effective_ngspice,
-                                              fidelity, channel_path))
+                                              fidelity, channel_path, channel_port_map))
     combined: dict[str, float] = {}
     failed_stage: str | None = None
     for runner in runners:
@@ -606,7 +664,23 @@ def evaluate_receiver(
         evaluation_id, provenance,
     )
     if cache and _evaluation_is_cacheable(evaluation):
-        cache.put(evaluation_id, evaluation.to_dict())
+        try:
+            if isinstance(cache, EvaluationCache):
+                cache.put(
+                    evaluation_id, evaluation.to_dict(),
+                    replace_existing=invalid_cached_entry,
+                )
+            else:
+                cache.put(evaluation_id, evaluation.to_dict())
+        except (OSError, TimeoutError) as exc:
+            warning = f"cache write failed without invalidating evaluation: {exc}"
+            stages = list(evaluation.stages)
+            if stages:
+                stages[-1] = replace(stages[-1], warnings=(*stages[-1].warnings, warning))
+            evaluation = replace(
+                evaluation, stages=tuple(stages),
+                provenance={**evaluation.provenance, "cache_write_error": str(exc)},
+            )
     return evaluation
 
 
@@ -616,6 +690,7 @@ def evaluate_pvt_grid(
     conditions: Iterable[SimulationConditions] = PVT_GRID,
     fidelity: EvaluationFidelity = EvaluationFidelity.FINAL,
     channel_path: str | Path = SYNTHETIC_CHANNEL,
+    channel_port_map: ChannelPortMap = ChannelPortMap(),
     sky130: Sky130Config | None = None,
     ngspice: NgSpiceConfig | None = None,
     cache: EvaluationCache | None = None,
@@ -625,7 +700,8 @@ def evaluate_pvt_grid(
     results: list[ReceiverEvaluation] = []
     for item in conditions:
         result = evaluate_receiver(
-            parameters, item, fidelity, channel_path=channel_path, sky130=sky130,
+            parameters, item, fidelity, channel_path=channel_path,
+            channel_port_map=channel_port_map, sky130=sky130,
             ngspice=ngspice, cache=cache,
         )
         results.append(result)

@@ -83,6 +83,12 @@ class ReceiverMetricTests(unittest.TestCase):
             "dfe_eye_height_v": 0.2,
             "dfe_locked_phase_eye_height_v": 0.08,
             "dfe_eye_width_ui": 0.5,
+            "dfe_error_count": 0,
+            "dfe_min_margin_v": 0.1,
+            "transient_output_min_v": 0.2,
+            "transient_output_max_v": 1.6,
+            "transient_supply_v": 1.8,
+            "transient_average_power_w": 1e-3,
         }
         violations = _transient_violations(metrics, EvaluationFidelity.CANDIDATE)
         self.assertTrue(any("locked phase" in item for item in violations))
@@ -122,6 +128,15 @@ class ConfigurationAndCacheTests(unittest.TestCase):
             path = cache._path("abcd")
             path.write_text('{"evaluation_id":"different"}', encoding="utf-8")
             self.assertIsNone(cache.get("abcd"))
+
+    def test_cache_can_repair_structurally_invalid_same_identity_entry(self):
+        with tempfile.TemporaryDirectory() as directory:
+            cache = EvaluationCache(directory)
+            path = cache._path("abcd")
+            path.parent.mkdir(parents=True)
+            path.write_text('{"evaluation_id":"abcd"}', encoding="utf-8")
+            cache.put("abcd", {"value": 7}, replace_existing=True)
+            self.assertEqual(cache.get("abcd")["value"], 7)
 
     def test_retryable_failures_are_not_cacheable(self):
         evaluation = ReceiverEvaluation(

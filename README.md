@@ -152,6 +152,18 @@ checks use the trained sampling phase and one contiguous opening around it.
 - ngspice (tested with the command-line executable)
 - A local SKY130A ngspice model installation
 
+Use one pinned interpreter for installation and test execution.  This avoids a
+common Windows failure where NumPy is installed for Python 3.12 but tests are
+launched by an MSYS Python 3.10:
+
+```powershell
+py -3.12 -m venv .venv
+.\.venv\Scripts\Activate.ps1
+python -m pip install -r requirements.txt
+python -c "import sys, numpy; print(sys.executable); print(numpy.__version__)"
+python -m unittest discover -v
+```
+
 Select ngspice when it is not already on `PATH`:
 
 ```powershell
@@ -164,6 +176,65 @@ committed:
 ```powershell
 $env:SKY130_MODEL_LIBRARY = 'C:\path\to\sky130A\libs.tech\ngspice\sky130.lib.spice'
 ```
+
+If SKY130 is not installed, use a pinned prebuilt release from the
+[`ciel` PDK manager](https://github.com/fossi-foundation/ciel), which is the
+package-manager route recommended by
+[`open_pdks`](https://github.com/RTimothyEdwards/open_pdks).  List available
+SKY130 releases, choose and record an exact commit, then enable it:
+
+```powershell
+python -m pip install ciel
+ciel ls-remote --pdk-family=sky130
+ciel enable --pdk-family=sky130 <commit-hash>
+```
+
+Do not silently switch PDK revisions between a baseline and its verification;
+the receiver-search manifest records the selected model checksum.
+
+On this Windows setup the complete PDK was already installed by `ciel` under
+WSL. Windows ngspice could not reliably open the WSL/UNC include tree, so the
+required `libs.tech/ngspice` and `libs.ref/sky130_fd_pr/spice` directories were
+staged under the ignored `.local-pdk/sky130A` directory. For Stage 1, generate a
+fast fixed-device selector from those official model files:
+
+```powershell
+python -m experiments.build_compact_sky130 `
+    .local-pdk\sky130A\libs.tech\ngspice\sky130.lib.spice
+$env:SKY130_MODEL_LIBRARY = (Resolve-Path `
+    .local-pdk\sky130A\libs.tech\ngspice\sky130.nebula_nfet.lib.spice).Path
+```
+
+The compact selector includes the official `sky130_fd_pr__nfet_01v8` model and
+mismatch parameters for `tt/ss/ff/sf/fs`; it is not a replacement for the full
+PDK in Stage 2. Provenance recursively fingerprints every included model file.
+
+The `$env:` assignments above apply only to the current PowerShell session.
+To save the locations permanently for the current Windows user, run:
+
+```powershell
+[Environment]::SetEnvironmentVariable(
+    "SKY130_MODEL_LIBRARY",
+    "C:\path\to\sky130A\libs.tech\ngspice\sky130.lib.spice",
+    "User"
+)
+
+[Environment]::SetEnvironmentVariable(
+    "NGSPICE_EXECUTABLE",
+    "C:\path\to\ngspice_con.exe",
+    "User"
+)
+```
+
+Open a new PowerShell window after saving the variables, then verify them with:
+
+```powershell
+$env:SKY130_MODEL_LIBRARY
+$env:NGSPICE_EXECUTABLE
+```
+
+`SKY130_MODEL_LIBRARY` is only required for the real-SKY130 integration tests;
+the lightweight tests run without a local PDK installation.
 
 The wrapper also discovers the standard `.ciel/sky130A`, `.volare/sky130A`,
 and `$PDK_ROOT/sky130A` layouts. This keeps project files free of user-specific
@@ -182,6 +253,14 @@ Use a real four-port channel when one is available:
 
 ```powershell
 python -m experiments.evaluate_receiver --channel C:\channels\board.s4p --fidelity candidate
+```
+
+Port order is explicit and one-based (`TXP TXN RXP RXN`).  The default is
+`1 2 3 4`; override it only from the channel vendor's documentation:
+
+```powershell
+python -m experiments.evaluate_receiver --channel C:\channels\board.s4p `
+  --channel-ports 1 3 2 4 --fidelity candidate
 ```
 
 Increase the per-ngspice timeout for a slow final run when necessary:
@@ -272,16 +351,111 @@ python -m experiments.sweep --mode random --count 50 --seed 7
 Run the pre-RL random-search baseline:
 
 ```powershell
-python -m experiments.search --count 100 --seed 7
+python -m experiments.receiver_search --preflight-only `
+    --model-library C:\path\to\sky130A\libs.tech\ngspice\sky130.lib.spice `
+    --ngspice-executable C:\path\to\ngspice_con.exe `
+    --channel C:\channels\qualified_receiver.s4p
+
+python -m experiments.receiver_search --count 100 --seed 7 `
+    --sampling-policy constraint_aware_v1 `
+    --model-library C:\path\to\sky130A\libs.tech\ngspice\sky130.lib.spice `
+    --ngspice-executable C:\path\to\ngspice_con.exe `
+    --channel C:\channels\qualified_receiver.s4p
 ```
 
-Each attempt is recorded incrementally as JSON Lines so a later failure does
-not discard earlier results. CSV is produced for completed sweeps. Generated
-result files are ignored by Git.
+The receiver search writes each attempt durably to JSON Lines and writes a
+sidecar manifest containing the seed, schema versions and channel checksum.
+It also fingerprints the Python evaluator, SPICE benches/block, PDK, ngspice,
+conditions and port map.  Use a clean Git commit for an official baseline;
+dirty work is fingerprinted but is harder for another person to reproduce.
+Rerunning the identical command resumes missing candidate indices; a changed
+manifest is rejected.  Use 100--500 designs before RL.  This command is a
+workflow, not evidence that a qualified baseline has been completed: do not
+train until the output contains the requested number of unique receiver rows
+using the intended SKY130 library and qualified real channel.
 
-The preliminary search score favors peaking near 6 dB and lower power. Raw
-measurements are stored separately from that score so the objective can change
-without rerunning ngspice.
+Local software/PDK baseline evidence from 2026-08-23 is preserved in `results/`
+(ignored by Git because it contains machine-specific paths):
+
+- full-space `uniform`, seed 7: 100/100 unique rows, 0 successes, with 78 DC,
+  21 AC and 1 transient failure;
+- `constraint_aware_v1`, seed 11: 100/100 unique rows, 14 successes, 84 AC and
+  2 transient failures, zero DC failures, reward range -100 to 100;
+- top-three replay with cache disabled: all evaluation IDs and metrics matched
+  at `rtol=1e-6`, `atol=1e-9`.
+
+Both runs use real SKY130 transistor models and the synthetic regression channel.
+They satisfy the pre-RL software baseline requirement but are not real-channel
+or PCIe qualification evidence.
+
+The preflight command does not run circuit simulations.  It resolves and
+fingerprints the PDK and ngspice executable, parses the selected port map,
+applies the same channel gates used by the evaluator, and reports the fitted
+delay relative to the phase-unwrapping ambiguity limit.  Treat a successful
+preflight as an input-integrity check, not as independent RF qualification.
+
+The CLI accepts `--timeout`, `--solver`, `--cache`, and `--no-cache` when the
+defaults are unsuitable.  A completed or interrupted checkpoint can be
+validated and summarized without launching ngspice:
+
+```powershell
+python -m experiments.receiver_search --summary-only `
+    --output results/receiver_random_search.jsonl
+```
+
+Completed runs also write `receiver_random_search.jsonl.summary.json`, which
+records completeness, missing indices, success/failure counts, reward bounds,
+unique evaluation identities, and the ten highest-scoring candidates.  The
+summary validates every row against the manifest before reporting results.
+
+After the checkpoint is complete, independently re-simulate the five
+highest-scoring candidates with cache disabled and compare every metric:
+
+```powershell
+python -m experiments.receiver_search --verify-top 5 `
+    --output results/receiver_random_search.jsonl `
+    --model-library C:\path\to\sky130A\libs.tech\ngspice\sky130.lib.spice `
+    --ngspice-executable C:\path\to\ngspice_con.exe
+```
+
+Verification first checks the current model, channel, ngspice, initialization,
+solver, and checksums against the stored manifest.  It then writes a
+`.verification.json` report.  A changed evaluation identity, success status,
+failed stage, missing metric, or metric outside `--metric-rtol` and
+`--metric-atol` makes verification fail.
+
+The versioned receiver score uses locked-phase DFE eye height, width, decision
+margin, CTLE power and peaking. Raw metrics and evaluation identities are kept
+so a later objective can be audited.
+
+## RL adapter contract
+
+`simulator.ReceiverRLAdapter` is the framework-independent boundary for later
+Gymnasium/RL integration.  It provides five normalized actions in `[-1, 1]`,
+fixed-shape finite observations with per-metric validity masks, signed
+constraint margins, a versioned reward, deterministic action sampling and a
+non-resettable lifetime evaluation budget. Candidate failures do not terminate
+an episode or silently reset the budget.
+
+```python
+from simulator import RLBudget, ReceiverRLAdapter
+
+adapter = ReceiverRLAdapter(seed=7, budget=RLBudget(max_evaluations=100))
+observation, info = adapter.reset(seed=7)
+step = adapter.step(adapter.sample_action())
+print(step.reward, step.constraints, step.info["reward_version"])
+```
+
+The adapter does not make the behavioral DFE or synthetic channel physical.
+Promotion to RL still requires a real-channel baseline, repeatability checks,
+and independent channel qualification.
+
+Channel filtering interpolates magnitude and unwrapped phase, which preserves
+bulk delay for adequately sampled Touchstone data.  Sparse frequency grids can
+still make phase unwrap/delay ambiguous (roughly beyond half the reciprocal of
+the largest frequency spacing).  Reject or resample such vendor data with a
+trusted RF tool; the built-in passivity/causality screens are not a replacement
+for scikit-rf or VNA-model qualification.
 
 ## Baseline verification
 
@@ -301,21 +475,20 @@ are trusted.
 
 ## RL readiness: strengths, weaknesses and next steps
 
-The wrapper is suitable for early, single-worker RL prototyping with the
-synthetic channel, but it is not yet reliable enough for large parallel
-training or reward generation from arbitrary real channel files. Its current
-overall readiness is approximately **5/10 as an RL backend**: the software
-contract and failure handling are strong, while several measurement and
-scalability issues could still teach an agent the wrong behavior.
+The main software correctness pass for an RL backend is implemented and covered
+by deterministic golden tests. A 100-design full-space baseline has been run
+with the real SKY130 device models and synthetic channel; real-channel baseline
+and repeatability evidence remain. Synthetic channels validate software behavior,
+not PCIe signoff behavior.
 
 | Area | Readiness | Current state |
 | --- | ---: | --- |
 | Parameter validation | 8/10 | Invalid designs and malformed conditions are handled cleanly |
 | Failure handling | 8/10 | Timeouts, convergence failures and internal errors become structured results |
 | Deterministic single-worker evaluation | 7/10 | Suitable for nominal and synthetic-channel experiments |
-| Real `.s4p` channel correctness | 4/10 | Bulk channel delay is not aligned with transmitted bit indices |
-| DFE measurement | 5/10 | DFE state is preserved, but phase selection is not DFE-aware |
-| Parallel RL workers | 3/10 | Concurrent cache writes can collide |
+| Real `.s4p` channel correctness | provisional | Port mapping, passivity, causality and delay alignment are gated; vendor/tool qualification remains |
+| DFE measurement | tested | Phase lock uses known-bit DFE-corrected margin and deterministic post-warm-up error-count/margin gates |
+| Parallel RL workers | tested locally | Per-key cache locking, atomic commits and thread/process stress tests are present |
 | Evaluation speed | 4/10 | Candidate fidelity is too expensive for every RL step |
 | Physical signoff coverage | 4/10 | Reflections, passivity, PVT, loading and parasitics need more work |
 
@@ -338,67 +511,55 @@ scalability issues could still teach an agent the wrong behavior.
 - Synthetic, lightweight-ngspice and optional real-SKY130 tests cover the main
   execution paths.
 
-### Weaknesses and correctness blockers
+### Implemented correctness gates and remaining qualification
 
-1. **Channel latency is not aligned.** A real S-parameter channel may delay the
-   waveform by several unit intervals. Searching only for a fractional phase
-   within one UI can compare received sample `n` with the wrong transmitted bit.
-2. **Sampling-phase training is not DFE-aware.** The best phase should be chosen
-   from the DFE-corrected training margin, not only the raw CTLE output.
-3. **Bit correctness is not a hard candidate constraint.** Eye height and width
-   can pass even if the deterministic waveform contains decision errors.
-4. **AC peak classification is incomplete.** Selecting the maximum only inside
-   the target band can incorrectly accept a monotonically rising response.
-5. **The cache is not parallel-safe.** Multiple workers can attempt to replace
-   the same temporary cache file, particularly on Windows.
-6. **The real-channel model is an approximation.** It uses matched differential
-   `Sdd21`; reflections, mode conversion, configurable port maps, passivity,
-   causality and impedance interactions are not fully modeled.
-7. **HD3 assumes effectively uniform transient samples.** Nonuniform output
-   should be validated or resampled before FFT analysis.
-8. **Some physical limits are informational only.** Output clipping, transient
-   average power, headroom and area are not all enforced as hard constraints.
+1. **Channel latency is aligned in software.** Fitted bulk delay, integer-bit
+   offset and fractional phase are recorded and tested from 0 through 20 UI.
+2. **Sampling-phase training is DFE-aware.** Only the known training window is
+   scored; measurement bits are excluded from phase selection.
+3. **Bit correctness is a hard constraint.** Every receiver fidelity requires
+   zero post-warm-up errors and positive minimum margin.
+4. **AC shapes are classified.** Local peaks and bounded high-frequency shelves
+   pass; an uncontrolled monotonic rise fails.
+5. **The cache is parallel-safe on local filesystems.** Per-identity locks,
+   unique temporary files and atomic first-valid-writer commits are stress-tested.
+6. **The real-channel model remains an approximation.** Configurable port maps,
+   passivity and band-limited causality screens are present, but `Sdd21` filtering
+   still omits a full reflected/mode-converted termination solution.
+7. **HD3 validates/resamples time output** and uses a conditioned multi-harmonic
+   fit; real-PDK bench correlation remains required.
+8. **DC rail headroom, transient average power and true rail excursions are hard gates.**
+   A resistively loaded differential pair is allowed to let its inactive output
+   return close to `VDD`; proximity alone is not classified as clipping.
+
+The random-search runner supports two manifest-pinned policies. `uniform` is the
+unbiased full action-space baseline. `constraint_aware_v1` still produces normalized
+random actions, but rejects combinations whose first-order resistive-load bias cannot
+meet DC headroom, whose degeneration time constant is far from the target band, or
+whose DFE tap is excessive for the synthetic channel. The simulator remains the final
+authority for every accepted action; this policy does not change the RL action bounds.
 
 The bundled synthetic channel has zero phase and exists only to test software
 deterministically. It must not be used as final PCIe channel evidence.
 
-### Recommended implementation order
+### Remaining qualification before RL training
 
-Complete a simulator-correctness and RL-contract pass before spending
-significant compute on training:
+The software suite covers analytic 0/0.3/0.7/0.99/1/5/20-UI delays,
+phase-sensitive DFE behavior, AC shapes, HD3 timebase/harmonic behavior, cache
+concurrency and the RL contract.  These are implementation tests, not a bit
+error-rate qualification or a substitute for an independent RF oracle.
 
-1. Estimate bulk delay from unwrapped `Sdd21` phase, align received samples with
-   transmitted bits, report channel latency, and discard invalid warm-up/tail
-   regions.
-2. Run training-mode DFE at each candidate sampling phase and select the phase
-   with the greatest corrected decision margin.
-3. Require zero post-warm-up errors and positive minimum decision margin for a
-   deterministic candidate evaluation.
-4. Define and test the required CTLE peak explicitly as a local peak, global
-   peak, or controlled high-frequency shelf.
-5. Make cache writes parallel-safe with unique temporary files and atomic
-   replacement.
-6. Make screening independent of the channel, then validate a requested channel
-   before starting expensive noise, HD3 or receiver stages.
-7. Add stage-level caching so a promoted design can reuse compatible DC, AC,
-   noise and HD3 results.
-8. Add an RL adapter with normalized actions, explicit observations and
-   constraints, deterministic seeds, evaluation budgets and a separately
-   versioned reward function.
-
-Before RL training, create a golden validation suite covering 0, 0.3, 1, 5 and
-20 UI channel delays, controlled precursor/postcursor ISI, monotonic and peaked
-AC responses, DFE phase-sensitive signals, repeated deterministic evaluations
-and concurrent cache writes. Then run a 100--500 design random-search baseline
-before single-worker RL. Enable multiple RL workers only after cache and
-reproducibility stress tests pass; reserve final fidelity and the full PVT grid
-for promoted designs.
+Before training, qualify the chosen real channel and port map with an external
+RF tool, run the checkpointed 100--500-design receiver baseline on a clean
+commit, repeat pinned candidates to establish numerical tolerance, and review
+failure distributions/reward rankings.  Reserve final fidelity and the full
+PVT grid for promoted designs.  Stage-level reuse across fidelity promotions is
+a remaining performance enhancement, not a reward-correctness prerequisite.
 
 ## Project boundaries
 
-This integration deliberately stops before the reinforcement-learning agent.
-The first four correctness blockers above should be resolved before trusting
-the wrapper's reward signal for real-channel training. Full Stage 2 work still
+This integration now provides the adapter contract but deliberately stops
+before selecting or training a reinforcement-learning algorithm. Full Stage 2 work still
 includes a physical bias/tail source, sampler and DFE, MOS sizing groups,
 parasitics, and layout-grounded area/power. The complete decision and
 deferred-work ledger is in `docs/stage1-decisions.md`.

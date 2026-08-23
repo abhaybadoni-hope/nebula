@@ -7,7 +7,7 @@ import json
 from pathlib import Path
 
 from simulator import (
-    EvaluationCache, EvaluationFidelity, NgSpiceConfig, ProcessCorner,
+    ChannelPortMap, EvaluationCache, EvaluationFidelity, NgSpiceConfig, ProcessCorner,
     ReceiverParameters, SimulationConditions, Sky130Config, evaluate_receiver,
 )
 
@@ -24,6 +24,10 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--supply", type=float, default=1.8)
     parser.add_argument("--fidelity", choices=[item.name.lower() for item in EvaluationFidelity], default="training")
     parser.add_argument("--channel", type=Path, default=Path("channels/synthetic_regression.s4p"))
+    parser.add_argument(
+        "--channel-ports", type=int, nargs=4, metavar=("TXP", "TXN", "RXP", "RXN"),
+        default=(1, 2, 3, 4), help="one-based Touchstone port mapping",
+    )
     parser.add_argument("--model-library", type=Path)
     parser.add_argument("--ngspice", type=Path)
     parser.add_argument(
@@ -50,6 +54,7 @@ def main() -> int:
         conditions,
         fidelity,
         channel_path=args.channel,
+        channel_port_map=ChannelPortMap(*args.channel_ports),
         sky130=Sky130Config(args.model_library),
         ngspice=ngspice,
         cache=None if args.no_cache else EvaluationCache(args.cache),

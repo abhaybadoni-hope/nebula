@@ -75,9 +75,10 @@ def expected_signs(bits):
     return numpy.where(values > 0, 1.0, -1.0)
 
 
-def sample_at_phase(time_s, waveform_v, bit_count: int, ui_s: float, phase_s: float) -> SamplingResult:
+def sample_at_phase(time_s, waveform_v, bit_count: int, ui_s: float, phase_s: float,
+                    start_time_s: float = 0.0) -> SamplingResult:
     numpy = require_numpy()
-    sample_times = numpy.arange(bit_count, dtype=float) * ui_s + phase_s
+    sample_times = numpy.arange(bit_count, dtype=float) * ui_s + start_time_s + phase_s
     if sample_times[-1] > time_s[-1]:
         raise ValueError("waveform does not cover all requested sample times")
     samples = numpy.interp(sample_times, time_s, waveform_v)
@@ -92,22 +93,75 @@ def choose_sampling_phase(
     training_start: int,
     training_stop: int,
     phase_step_s: float,
+    tap_v: float = 0.0,
+    threshold_v: float = 0.0,
+    initial_previous_bit: int = 0,
+    start_time_s: float = 0.0,
+    reference_phase_s: float | None = None,
 ) -> SamplingResult:
     numpy = require_numpy()
-    signs = expected_signs(bits)
-    best: SamplingResult | None = None
-    best_score = -float("inf")
-    phases = numpy.arange(phase_step_s, ui_s, phase_step_s)
+    phases = numpy.arange(0.0, ui_s, phase_step_s)
+    candidates: list[SamplingResult] = []
+    scores: list[float] = []
     for phase in phases:
-        candidate = sample_at_phase(time_s, waveform_v, len(bits), ui_s, float(phase))
-        margins = signs[training_start:training_stop] * candidate.raw_samples_v[training_start:training_stop]
+        candidate = sample_at_phase(
+            time_s, waveform_v, len(bits), ui_s, float(phase), start_time_s,
+        )
+        raw = candidate.raw_samples_v
+        aligned_bits = numpy.asarray(bits, dtype=int)
+        adjusted_start, adjusted_stop = training_start, training_stop
+        if reference_phase_s is not None:
+            signed_delta = ((phase - reference_phase_s + ui_s / 2) % ui_s) - ui_s / 2
+            symbol_shift = int(round((phase - reference_phase_s - signed_delta) / ui_s))
+            if symbol_shift < 0:
+                raw = raw[-symbol_shift:]
+                aligned_bits = aligned_bits[:len(raw)]
+            elif symbol_shift > 0:
+                raw = raw[:-symbol_shift]
+                aligned_bits = aligned_bits[symbol_shift:]
+                adjusted_start = max(0, training_start - symbol_shift)
+                adjusted_stop = max(adjusted_start, training_stop - symbol_shift)
+        # Phase lock sees the signal the decision device sees.  During phase
+        # training all feedback symbols are known, preventing phase choice from
+        # being biased by decision-error propagation.
+        dfe = apply_hybrid_one_tap_dfe(
+            raw, aligned_bits, tap_v, training_stop=len(aligned_bits),
+            threshold_v=threshold_v, initial_previous_bit=initial_previous_bit,
+        )
+        signs = expected_signs(aligned_bits)
+        margins = signs[adjusted_start:adjusted_stop] * (
+            dfe.corrected_samples_v[adjusted_start:adjusted_stop] - threshold_v
+        )
         score = float(numpy.percentile(margins, 10))
-        if score > best_score:
-            best_score = score
-            best = candidate
-    if best is None:
+        candidates.append(candidate)
+        scores.append(score)
+    if not candidates:
         raise ValueError("no valid sampling phase was evaluated")
-    return best
+    score_values = numpy.asarray(scores)
+    best_score = float(numpy.max(score_values))
+    tolerance = max(1e-12, abs(best_score) * 1e-9)
+    plateau = score_values >= best_score - tolerance
+    if numpy.all(plateau):
+        target = ui_s / 2 if reference_phase_s is None else reference_phase_s % ui_s
+        best_index = int(numpy.argmin(numpy.abs(((phases - target + ui_s / 2) % ui_s) - ui_s / 2)))
+        return candidates[best_index]
+    starts = [index for index, value in enumerate(plateau) if value and not plateau[index - 1]]
+    runs: list[list[int]] = []
+    for start in starts:
+        run = [start]
+        index = (start + 1) % len(plateau)
+        while index != start and plateau[index]:
+            run.append(index)
+            index = (index + 1) % len(plateau)
+        runs.append(run)
+    target = ui_s / 2 if reference_phase_s is None else reference_phase_s % ui_s
+    def rank(run):
+        center = run[(len(run) - 1) // 2]
+        distance = abs(((phases[center] - target + ui_s / 2) % ui_s) - ui_s / 2)
+        return len(run), -distance
+    selected_run = max(runs, key=rank)
+    best_index = selected_run[(len(selected_run) - 1) // 2]
+    return candidates[best_index]
 
 
 def apply_one_tap_dfe(
@@ -170,26 +224,52 @@ def dfe_eye_metrics(
     numpy = require_numpy()
     bits_array = numpy.asarray(bits, dtype=int)
     phases = numpy.arange(phase_step_s, ui_s, phase_step_s)
-    heights: list[float] = []
-    for phase in phases:
-        raw = sample_at_phase(time_s, waveform_v, len(bits_array), ui_s, float(phase)).raw_samples_v
-        corrected = apply_hybrid_one_tap_dfe(
-            raw, bits_array, tap_v, training_stop,
-        ).corrected_samples_v[start_bit:stop_bit]
-        section_bits = bits_array[start_bit:stop_bit]
-        ones = corrected[section_bits == 1]
-        zeros = corrected[section_bits == 0]
-        if not len(ones) or not len(zeros):
-            heights.append(float("nan"))
-        else:
-            heights.append(float(numpy.percentile(ones, 10) - numpy.percentile(zeros, 90)))
+    def phase_heights(reference_phase_s: float | None) -> list[float]:
+        heights: list[float] = []
+        for phase in phases:
+            raw = sample_at_phase(time_s, waveform_v, len(bits_array), ui_s, float(phase)).raw_samples_v
+            expected = bits_array
+            adjusted_training_stop = training_stop
+            adjusted_start, adjusted_stop = start_bit, stop_bit
+            if reference_phase_s is not None:
+                signed_delta = ((phase - reference_phase_s + ui_s / 2) % ui_s) - ui_s / 2
+                symbol_shift = int(round((phase - reference_phase_s - signed_delta) / ui_s))
+                if symbol_shift < 0:
+                    raw = raw[-symbol_shift:]
+                    expected = expected[:len(raw)]
+                elif symbol_shift > 0:
+                    raw = raw[:-symbol_shift]
+                    expected = expected[symbol_shift:]
+                    adjusted_training_stop = max(0, training_stop - symbol_shift)
+                    adjusted_start = max(0, start_bit - symbol_shift)
+                    adjusted_stop = max(adjusted_start, stop_bit - symbol_shift)
+            corrected_all = apply_hybrid_one_tap_dfe(
+                raw, expected, tap_v, adjusted_training_stop,
+            ).corrected_samples_v
+            corrected = corrected_all[adjusted_start:adjusted_stop]
+            section_bits = expected[adjusted_start:adjusted_stop]
+            ones = corrected[section_bits == 1]
+            zeros = corrected[section_bits == 0]
+            if not len(ones) or not len(zeros):
+                heights.append(float("nan"))
+            else:
+                heights.append(float(numpy.percentile(ones, 10) - numpy.percentile(zeros, 90)))
+        return heights
+
+    heights = phase_heights(locked_phase_s)
+    if locked_phase_s is None:
+        preliminary = numpy.asarray(heights)
+        if not numpy.any(numpy.isfinite(preliminary)):
+            raise ValueError("DFE eye calculation has no phases containing both symbols")
+        locked_phase_s = float(phases[int(numpy.nanargmax(preliminary))])
+        heights = phase_heights(locked_phase_s)
     values = numpy.asarray(heights)
     valid = numpy.isfinite(values)
     if not numpy.any(valid):
         raise ValueError("DFE eye calculation has no phases containing both symbols")
     best_index = int(numpy.nanargmax(values))
     open_mask = valid & (values >= minimum_height_v)
-    anchor = best_index if locked_phase_s is None else int(numpy.argmin(numpy.abs(phases - locked_phase_s)))
+    anchor = int(numpy.argmin(numpy.abs(phases - locked_phase_s)))
     return {
         "dfe_eye_height_v": float(values[best_index]),
         "dfe_eye_width_ui": _contiguous_open_width(open_mask, anchor, phase_step_s, ui_s),

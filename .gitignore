@@ -4,6 +4,7 @@
 *.log
 *.raw
 results/*.jsonl
+results/*.jsonl.*.json
 results/*.csv
 generated/
 .nebula-cache/
@@ -23,4 +24,5 @@ venv/
 
 # Local PDK / CIEL
 .ciel/
+.local-pdk/
 local_backup/

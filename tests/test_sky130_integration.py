@@ -23,9 +23,14 @@ class Sky130IntegrationTest(unittest.TestCase):
         self.assertAlmostEqual(result.metrics["peaking_2p5ghz_db"], 5.71, delta=1.0)
         self.assertAlmostEqual(result.metrics["gain_100ghz_db"], 1.37, delta=1.5)
 
-    def test_hierarchical_candidate_baseline(self):
+    def test_hierarchical_candidate_reference(self):
         result = evaluate_receiver(
-            ReceiverParameters(), SimulationConditions(),
+            ReceiverParameters(
+                rload_ohm=400.0,
+                rdeg_ohm=200.0,
+                cdeg_f=1e-12,
+                itail_a=1e-3,
+            ), SimulationConditions(),
             EvaluationFidelity.CANDIDATE,
             sky130=Sky130Config(MODEL),
             ngspice=NgSpiceConfig(timeout_s=180),
@@ -34,7 +39,7 @@ class Sky130IntegrationTest(unittest.TestCase):
         self.assertTrue(result.success, result.to_dict())
         self.assertEqual(
             [stage.name for stage in result.stages],
-            ["dc", "ac", "ctle_transient", "noise", "hd3", "channel", "transient"],
+            ["dc", "ac", "ctle_transient", "channel", "noise", "hd3", "transient"],
         )
         self.assertGreaterEqual(result.metrics["peaking_db"], 3.0)
         self.assertLessEqual(result.metrics["peaking_db"], 12.0)
