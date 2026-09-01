@@ -30,6 +30,7 @@ SPICE_FREE_MODULES = [
     "tests.test_pvt_selection",
     "tests.test_final_specification",
     "tests.test_run_autockt_pipeline",
+    "tests.test_learning_evidence",
 ]
 
 
