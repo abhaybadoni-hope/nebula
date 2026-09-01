@@ -42,7 +42,11 @@ from experiments.train_autockt import _resolve_initial_indices
 
 from analysis.design_catalog import FeasibleDesign, rank_by_measured_trade_offs
 from analysis.final_specification import build_final_specification_report, format_report
-from analysis.pvt_selection import PVTRobustnessResult, rank_by_robustness, run_pvt_evaluation
+from analysis.pvt_selection import (
+    PVTRobustnessResult,
+    run_pvt_evaluation,
+    select_with_trade_off_preference,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -180,14 +184,20 @@ def select_final_design(
     pvt_conditions: Optional[tuple] = None,
     pvt_fidelity=None,
     minimum_pass_rate: float = 1.0,
+    trade_off_preference: str = "most_robust",
 ) -> dict[str, Any]:
     """Priority, deterministic and documented (not an arbitrary weighted
     score): (1) nominal feasibility -- already guaranteed by only receiving
     `feasible_candidates`; (2) PVT pass rate, if `pvt_conditions` given
-    (highest first); (3) among ties, analysis.design_catalog's measured
-    trade-off ranking (deterministic dict/list order). PVT is evaluated
-    (spending real SPICE) ONLY for candidates reaching this stage, and ONLY
-    if the caller explicitly supplies `pvt_conditions` -- never automatic.
+    (highest first); (3) robustness tie-break (n_conditions descending);
+    (4) among any remaining PVT ties, `trade_off_preference` (one of
+    `analysis.pvt_selection.TRADE_OFF_PREFERENCES`) via
+    `analysis.pvt_selection.select_with_trade_off_preference` -- never
+    overriding a strictly higher PVT pass rate. When `pvt_conditions` is
+    None, falls back to nominal-only trade-off ranking (unchanged). PVT is
+    evaluated (spending real SPICE) ONLY for candidates reaching this
+    stage, and ONLY if the caller explicitly supplies `pvt_conditions` --
+    never automatic.
     """
 
     designs = [_candidate_to_design(c) for c in feasible_candidates]
@@ -209,8 +219,9 @@ def select_final_design(
     pvt_results: list[PVTRobustnessResult] = [
         run_pvt_evaluation(d, pvt_conditions, fidelity=fidelity) for d in designs
     ]
-    ranked_pvt = rank_by_robustness(pvt_results)
-    top = ranked_pvt[0]
+    top = select_with_trade_off_preference(
+        pvt_results, designs, preference=trade_off_preference, minimum_pass_rate=minimum_pass_rate,
+    )
     matching_design = next(d for d in designs if d.design_id == top.design_id)
     return {
         "selected": {
@@ -225,7 +236,10 @@ def select_final_design(
                 for p in top.worst_case_conditions
             ],
         },
-        "selection_basis": f"PVT-ranked across {len(pvt_conditions)} conditions",
+        "selection_basis": (
+            f"PVT-ranked across {len(pvt_conditions)} conditions, "
+            f"trade_off_preference={trade_off_preference!r}"
+        ),
     }
 
 
@@ -245,6 +259,7 @@ def run_pipeline(
     randomize_initial_state: bool = True,
     initial_indices_source: str = "verified",
     pvt_conditions: Optional[tuple] = None,
+    trade_off_preference: str = "most_robust",
     export_schematic_to: Optional[Path] = None,
 ) -> dict[str, Any]:
     problems = validate_target(target)
@@ -257,7 +272,9 @@ def run_pipeline(
         initial_indices_source=initial_indices_source,
     )
     feasible = filter_nominal_feasible(candidates)
-    selection = select_final_design(feasible, pvt_conditions=pvt_conditions)
+    selection = select_final_design(
+        feasible, pvt_conditions=pvt_conditions, trade_off_preference=trade_off_preference,
+    )
 
     result: dict[str, Any] = {
         "target": target.as_dict(),

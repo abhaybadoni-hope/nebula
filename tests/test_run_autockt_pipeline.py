@@ -154,6 +154,49 @@ class SelectFinalDesignTests(unittest.TestCase):
         self.assertEqual(selection["pvt"]["pass_rate"], 1.0)
         self.assertTrue(selection["pvt"]["met_minimum_pass_rate"])
 
+    def test_pvt_tie_is_broken_by_trade_off_preference(self):
+        # Task 3 (NEXT IMPLEMENTATION CHUNK): select_final_design must
+        # actually use analysis.pvt_selection.select_with_trade_off_
+        # preference, not just rank_by_robustness, so a genuine PVT tie is
+        # broken by the caller's stated preference rather than by
+        # incidental list order.
+        from simulator.config import ProcessCorner, SimulationConditions
+        from simulator.receiver import EvaluationFidelity, ReceiverEvaluation
+
+        candidates = [
+            PipelineCandidate(0, {"rload_ohm": 1000.0, "rdeg_ohm": 1000.0, "cdeg_f": 5e-13,
+                                  "itail_a": 1e-4, "dfe_tap_v": 0.0},
+                               {"ctle_power_w": 0.01, "dfe_locked_phase_eye_height_v": 1.0,
+                                "dfe_eye_width_ui": 0.5, "dfe_min_margin_v": 0.3}, 10.0, True, 1),
+            PipelineCandidate(1, {"rload_ohm": 2000.0, "rdeg_ohm": 1000.0, "cdeg_f": 5e-13,
+                                  "itail_a": 1e-4, "dfe_tap_v": 0.0},
+                               {"ctle_power_w": 0.001, "dfe_locked_phase_eye_height_v": 1.0,
+                                "dfe_eye_width_ui": 0.5, "dfe_min_margin_v": 0.3}, 10.0, True, 1),
+        ]
+        conditions = (SimulationConditions(ProcessCorner.TT, 27.0, 1.8),)
+
+        def fake_evaluate_pvt_grid(parameters, *, conditions, fidelity):
+            # both designs pass at every condition -- a genuine tie.
+            return tuple(
+                ReceiverEvaluation(True, parameters, c, fidelity, (), {}, None, 0.0, "id", {})
+                for c in conditions
+            )
+
+        with patch("analysis.pvt_selection.evaluate_pvt_grid", side_effect=fake_evaluate_pvt_grid):
+            lowest_power = select_final_design(
+                candidates, pvt_conditions=conditions, trade_off_preference="lowest_power",
+            )
+            most_robust = select_final_design(
+                candidates, pvt_conditions=conditions, trade_off_preference="most_robust",
+            )
+
+        # pipeline_ep1 has the lower ctle_power_w (0.001 vs 0.01).
+        self.assertEqual(lowest_power["selected"]["design_id"], "pipeline_ep1")
+        self.assertIn("lowest_power", lowest_power["selection_basis"])
+        # 'most_robust' ignores trade-offs and returns the first by
+        # robustness order among the tie -- pipeline_ep0.
+        self.assertEqual(most_robust["selected"]["design_id"], "pipeline_ep0")
+
 
 class CLIIntegrationTests(unittest.TestCase):
     def test_full_synthetic_dry_run_produces_a_structured_result_with_schematic_and_spec(self):
