@@ -28,6 +28,8 @@ SPICE_FREE_MODULES = [
     "tests.test_area_estimate",
     "tests.test_design_catalog",
     "tests.test_pvt_selection",
+    "tests.test_final_specification",
+    "tests.test_run_autockt_pipeline",
 ]
 
 
