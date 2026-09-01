@@ -67,7 +67,7 @@ class RunPvtEvaluationTests(unittest.TestCase):
             design_id="test_design", source_file="f", source_description="d",
             parameters={"rload_ohm": 1000.0, "rdeg_ohm": 1000.0, "cdeg_f": 5e-13,
                         "itail_a": 1e-4, "dfe_tap_v": 0.0},
-            metrics={}, reward=10.0,
+            metrics={}, native_reward=10.0, native_reward_scale="autockt_reward",
         )
         conditions = (
             SimulationConditions(ProcessCorner.TT, 27.0, 1.8),

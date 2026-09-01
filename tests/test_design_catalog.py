@@ -27,25 +27,25 @@ class DeduplicateTests(unittest.TestCase):
     def test_drops_exact_duplicate_parameter_sets(self):
         base_params = {"rload_ohm": 1000.0, "rdeg_ohm": 500.0, "cdeg_f": 1e-13,
                         "itail_a": 1e-4, "dfe_tap_v": 0.0}
-        a = FeasibleDesign("a", "f", "d", base_params, {}, 10.0)
-        b = FeasibleDesign("b", "f", "d", dict(base_params), {}, 10.0)
+        a = FeasibleDesign("a", "f", "d", base_params, {}, 10.0, "autockt_reward")
+        b = FeasibleDesign("b", "f", "d", dict(base_params), {}, 10.0, "autockt_reward")
         unique = deduplicate([a, b])
         self.assertEqual(len(unique), 1)
         self.assertEqual(unique[0].design_id, "a")  # keeps first occurrence
 
     def test_keeps_genuinely_different_designs(self):
         a = FeasibleDesign("a", "f", "d", {"rload_ohm": 1000.0, "rdeg_ohm": 500.0,
-                            "cdeg_f": 1e-13, "itail_a": 1e-4, "dfe_tap_v": 0.0}, {}, 10.0)
+                            "cdeg_f": 1e-13, "itail_a": 1e-4, "dfe_tap_v": 0.0}, {}, 10.0, "autockt_reward")
         b = FeasibleDesign("b", "f", "d", {"rload_ohm": 2000.0, "rdeg_ohm": 500.0,
-                            "cdeg_f": 1e-13, "itail_a": 1e-4, "dfe_tap_v": 0.0}, {}, 10.0)
+                            "cdeg_f": 1e-13, "itail_a": 1e-4, "dfe_tap_v": 0.0}, {}, 10.0, "autockt_reward")
         unique = deduplicate([a, b])
         self.assertEqual(len(unique), 2)
 
 
 class RankByMeasuredTradeOffsTests(unittest.TestCase):
     def test_label_only_assigned_to_the_actual_best_measured_value(self):
-        low_power = FeasibleDesign("low_power", "f", "d", {}, {"ctle_power_w": 0.001}, 10.0)
-        high_power = FeasibleDesign("high_power", "f", "d", {}, {"ctle_power_w": 0.010}, 10.0)
+        low_power = FeasibleDesign("low_power", "f", "d", {}, {"ctle_power_w": 0.001}, 10.0, "autockt_reward")
+        high_power = FeasibleDesign("high_power", "f", "d", {}, {"ctle_power_w": 0.010}, 10.0, "autockt_reward")
         ranked = rank_by_measured_trade_offs([low_power, high_power])
         by_id = {r.design.design_id: r.trade_off_labels for r in ranked}
         self.assertIn("lowest_power", by_id["low_power"])
@@ -55,11 +55,11 @@ class RankByMeasuredTradeOffsTests(unittest.TestCase):
         best = FeasibleDesign("best", "f", "d", {}, {
             "ctle_power_w": 0.001, "dfe_locked_phase_eye_height_v": 2.0,
             "dfe_eye_width_ui": 0.9, "dfe_min_margin_v": 0.6,
-        }, 10.0)
+        }, 10.0, "autockt_reward")
         middling = FeasibleDesign("middling", "f", "d", {}, {
             "ctle_power_w": 0.005, "dfe_locked_phase_eye_height_v": 1.0,
             "dfe_eye_width_ui": 0.5, "dfe_min_margin_v": 0.3,
-        }, 10.0)
+        }, 10.0, "autockt_reward")
         ranked = rank_by_measured_trade_offs([best, middling])
         by_id = {r.design.design_id: r.trade_off_labels for r in ranked}
         self.assertEqual(by_id["middling"], ("balanced",))
@@ -68,8 +68,8 @@ class RankByMeasuredTradeOffsTests(unittest.TestCase):
         self.assertEqual(rank_by_measured_trade_offs([]), [])
 
     def test_ties_can_produce_multiple_winners(self):
-        a = FeasibleDesign("a", "f", "d", {}, {"ctle_power_w": 0.001}, 10.0)
-        b = FeasibleDesign("b", "f", "d", {}, {"ctle_power_w": 0.001}, 10.0)
+        a = FeasibleDesign("a", "f", "d", {}, {"ctle_power_w": 0.001}, 10.0, "autockt_reward")
+        b = FeasibleDesign("b", "f", "d", {}, {"ctle_power_w": 0.001}, 10.0, "autockt_reward")
         ranked = rank_by_measured_trade_offs([a, b])
         for entry in ranked:
             self.assertIn("lowest_power", entry.trade_off_labels)
@@ -100,7 +100,9 @@ class LoadRealDataGroundTruthTests(unittest.TestCase):
         designs = load_rc_counterfactual_survivors(path)
         self.assertEqual(len(designs), 7)  # confirmed count from docs sec 17
         for design in designs:
-            self.assertEqual(design.reward, 10.0)
+            self.assertEqual(design.native_reward, 10.0)
+            self.assertEqual(design.native_reward_scale, "autockt_reward")
+            self.assertEqual(design.uniform_reward, 10.0)
 
     def test_missing_source_file_returns_empty_not_an_error(self):
         self.assertEqual(load_reward_directed_smoke_designs("results/does_not_exist.jsonl"), [])
@@ -122,6 +124,25 @@ class BuildCatalogTests(unittest.TestCase):
         catalog = build_catalog()
         keys = [entry.design.parameter_key() for entry in catalog]
         self.assertEqual(len(keys), len(set(keys)))
+
+    def test_native_reward_scale_is_disclosed_and_not_uniformly_comparable(self):
+        # Regression guard for a real bug caught and fixed: sources use
+        # different reward functions (autockt_reward, max 10.0, vs
+        # reward_v1, a different scale) -- native_reward must never be
+        # silently treated as comparable across differing scales.
+        catalog = build_catalog()
+        scales = {entry.design.native_reward_scale for entry in catalog}
+        self.assertTrue(scales)  # at least one scale present
+        for entry in catalog:
+            self.assertIn(entry.design.native_reward_scale, ("autockt_reward", "reward_v1", "receiver_reward_v1"))
+
+    def test_uniform_reward_is_comparable_across_the_whole_catalog(self):
+        # Unlike native_reward, uniform_reward is recomputed the same way
+        # for every entry and must agree (every catalog member is already
+        # uniform-criterion feasible, so this is always the terminal bonus).
+        catalog = build_catalog()
+        for entry in catalog:
+            self.assertEqual(entry.design.uniform_reward, 10.0)
 
 
 if __name__ == "__main__":

@@ -35,10 +35,27 @@ class FeasibleDesign:
     source_description: str
     parameters: dict[str, float]
     metrics: dict[str, float]
-    reward: float
+    native_reward: float
+    native_reward_scale: str  # "autockt_reward" (max 10.0) or "reward_v1" (different scale/semantics) --
+    # sources use different reward functions; native_reward is NOT comparable
+    # across differing native_reward_scale values. See uniform_reward below
+    # for a value that IS comparable across the whole catalog.
 
     def parameter_key(self, ndigits: int = 6) -> tuple:
         return tuple(round(self.parameters[name], ndigits) for name in sorted(self.parameters))
+
+    @property
+    def uniform_reward(self) -> float:
+        """autockt_reward recomputed from this design's own real metrics
+        against COMPARISON_TARGET -- comparable across every catalog entry
+        regardless of which reward function originally scored it. Every
+        catalog entry is already uniform-criterion feasible by construction,
+        so this is always exactly TERMINAL_BONUS (10.0) for anything in the
+        catalog -- it confirms shared-criterion feasibility, not a ranking
+        signal (use trade_off_labels / raw metrics for that).
+        """
+        from rl.autockt_reward import autockt_reward
+        return autockt_reward(self.metrics, COMPARISON_TARGET, success=True)
 
 
 def _design_a() -> FeasibleDesign:
@@ -59,7 +76,7 @@ def _design_a() -> FeasibleDesign:
             "dfe_min_margin_v": 0.5174474651666459,
             "ctle_power_w": 0.0010850994,
         },
-        reward=10.0,
+        native_reward=10.0, native_reward_scale="autockt_reward",
     )
 
 
@@ -100,7 +117,7 @@ def load_reward_directed_smoke_designs(
             f"episode {row['episode']} step {row['step']}",
             parameters=dict(row["parameters"]),
             metrics=metrics,
-            reward=float(row["reward"]),
+            native_reward=float(row["reward"]), native_reward_scale=row.get("reward_version", "reward_v1"),
         ))
     return designs
 
@@ -136,7 +153,7 @@ def load_rc_counterfactual_survivors(
             f"offset {row['index_offset']:+d} grid steps from that sweep's baseline design",
             parameters=dict(row["parameters"]),
             metrics=dict(row["metrics"]),
-            reward=float(row["autockt_reward"]),
+            native_reward=float(row["autockt_reward"]), native_reward_scale="autockt_reward",
         ))
     return designs
 
@@ -231,7 +248,9 @@ def _main() -> int:
             "source_description": entry.design.source_description,
             "parameters": entry.design.parameters,
             "metrics": entry.design.metrics,
-            "reward": entry.design.reward,
+            "native_reward": entry.design.native_reward,
+            "native_reward_scale": entry.design.native_reward_scale,
+            "uniform_reward": entry.design.uniform_reward,
             "trade_off_labels": list(entry.trade_off_labels),
         })
     output_path = Path("results/feasible_design_catalog.jsonl")
