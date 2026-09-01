@@ -364,6 +364,14 @@ def run_pipeline(
 def _main() -> int:
     parser = argparse.ArgumentParser(description="End-to-end NEBULA pipeline: target -> PPO -> SPICE -> final design.")
     parser.add_argument("--target-mode", choices=("trivial", "hard"), default="trivial")
+    parser.add_argument(
+        "--target-json", type=str, default=None,
+        help="Optional JSON object with the 4 TargetSpec fields "
+             f"({', '.join(SPEC_NAMES)}) to use an arbitrary target instead of "
+             "--target-mode's two presets -- e.g. for a UI/judge-entered spec. "
+             "Still just constructs rl.target_spec.TargetSpec, the same class "
+             "--target-mode uses; no new target semantics.",
+    )
     parser.add_argument("--checkpoint", type=Path, default=None)
     parser.add_argument("--backend", choices=("real", "synthetic"), default="synthetic")
     parser.add_argument("--episodes", type=int, default=3)
@@ -387,7 +395,14 @@ def _main() -> int:
     if args.output.exists():
         raise FileExistsError(f"refusing to overwrite existing {args.output}")
 
-    target = TargetSpec.from_hard_target() if args.target_mode == "hard" else TargetSpec.from_existing_thresholds()
+    if args.target_json is not None:
+        spec_values = json.loads(args.target_json)
+        missing = [name for name in SPEC_NAMES if name not in spec_values]
+        if missing:
+            raise ValueError(f"--target-json is missing required field(s): {missing}")
+        target = TargetSpec(**{name: float(spec_values[name]) for name in SPEC_NAMES})
+    else:
+        target = TargetSpec.from_hard_target() if args.target_mode == "hard" else TargetSpec.from_existing_thresholds()
 
     result = run_pipeline(
         target=target, checkpoint_path=args.checkpoint, agent_seed=args.agent_seed, eval_seed=args.eval_seed,

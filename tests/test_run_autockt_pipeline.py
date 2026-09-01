@@ -326,6 +326,37 @@ class CLIIntegrationTests(unittest.TestCase):
                                 if r["metric"] == "PVT (pass/total)")
                 self.assertEqual(pvt_row["measured"], "2/2")
 
+    def test_target_json_flag_builds_an_arbitrary_target(self):
+        import json as _json
+        with TemporaryDirectory() as tmp:
+            output = Path(tmp) / "result.json"
+            custom_target = {
+                "dfe_locked_phase_eye_height_v": 0.2, "dfe_eye_width_ui": 0.5,
+                "dfe_min_margin_v": 0.05, "ctle_power_w": 0.012,
+            }
+            argv = [
+                "run_autockt_pipeline.py", "--backend", "synthetic", "--episodes", "1",
+                "--horizon", "1", "--initial-indices-source", "grid-center",
+                "--target-json", _json.dumps(custom_target),
+                "--output", str(output),
+            ]
+            with patch("sys.argv", argv):
+                _main()
+            result = _json.loads(output.read_text(encoding="utf-8"))
+            self.assertEqual(result["target"], custom_target)
+
+    def test_target_json_missing_field_raises_clearly(self):
+        with TemporaryDirectory() as tmp:
+            output = Path(tmp) / "result.json"
+            argv = [
+                "run_autockt_pipeline.py", "--backend", "synthetic", "--episodes", "1",
+                "--target-json", '{"dfe_locked_phase_eye_height_v": 0.2}',
+                "--output", str(output),
+            ]
+            with patch("sys.argv", argv):
+                with self.assertRaises(ValueError):
+                    _main()
+
     def test_default_pvt_condition_set_is_none_unchanged_behavior(self):
         with TemporaryDirectory() as tmp:
             output = Path(tmp) / "result.json"
