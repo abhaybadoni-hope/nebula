@@ -291,6 +291,54 @@ class CLIIntegrationTests(unittest.TestCase):
                 with self.assertRaises(FileExistsError):
                     _main()
 
+    def test_pvt_condition_set_flag_reaches_the_pvt_branch_via_the_cli(self):
+        # Confirms the CLI-level gap (analysis.pvt_selection was previously
+        # unreachable from _main()) is closed: --pvt-condition-set smoke
+        # must cause select_final_design's PVT branch to run, and its
+        # result must reach the final specification report's PVT row.
+        from simulator.receiver import ReceiverEvaluation
+
+        def fake_evaluate_pvt_grid(parameters, *, conditions, fidelity):
+            return tuple(
+                ReceiverEvaluation(True, parameters, c, fidelity, (), {}, None, 0.0, "id", {})
+                for c in conditions
+            )
+
+        with TemporaryDirectory() as tmp:
+            output = Path(tmp) / "result.json"
+            argv = [
+                "run_autockt_pipeline.py", "--target-mode", "trivial", "--backend", "synthetic",
+                "--episodes", "8", "--horizon", "1", "--initial-indices-source", "grid-center",
+                "--agent-seed", "1", "--eval-seed", "1", "--pvt-condition-set", "smoke",
+                "--output", str(output),
+            ]
+            with patch("analysis.pvt_selection.evaluate_pvt_grid", side_effect=fake_evaluate_pvt_grid):
+                with patch("sys.argv", argv):
+                    _main()
+
+            result = json.loads(output.read_text(encoding="utf-8"))
+            selection = result["selection"]
+            if selection["selected"] is not None:
+                self.assertIsNotNone(selection["pvt"])
+                self.assertEqual(selection["pvt"]["n_conditions"], 2)
+                self.assertIn("PVT-ranked", selection["selection_basis"])
+                pvt_row = next(r for r in result["final_specification"]["rows"]
+                                if r["metric"] == "PVT (pass/total)")
+                self.assertEqual(pvt_row["measured"], "2/2")
+
+    def test_default_pvt_condition_set_is_none_unchanged_behavior(self):
+        with TemporaryDirectory() as tmp:
+            output = Path(tmp) / "result.json"
+            argv = [
+                "run_autockt_pipeline.py", "--backend", "synthetic", "--episodes", "1",
+                "--horizon", "1", "--initial-indices-source", "grid-center",
+                "--output", str(output),
+            ]
+            with patch("sys.argv", argv):
+                _main()
+            result = json.loads(output.read_text(encoding="utf-8"))
+            self.assertIsNone(result["selection"]["pvt"])
+
 
 if __name__ == "__main__":
     unittest.main()

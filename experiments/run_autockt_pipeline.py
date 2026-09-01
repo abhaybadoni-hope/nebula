@@ -28,6 +28,7 @@ from typing import Any, Optional
 
 import torch
 
+from simulator.config import ProcessCorner, SimulationConditions
 from simulator.rl_adapter import ReceiverRLAdapter, RLBudget
 
 from rl.autockt_env import AutoCktReceiverEnv
@@ -48,6 +49,25 @@ from analysis.pvt_selection import (
     run_pvt_evaluation,
     select_with_trade_off_preference,
 )
+
+
+# ---------------------------------------------------------------------------
+# CLI-only: named PVT condition sets (mirrors experiments/pvt_sweep.py's
+# --condition-set pattern). "smoke" is intentionally the smallest set that
+# still exercises the PVT-aware SELECTION LOGIC (pass-rate ranking, tie-break,
+# trade-off preference) with more than one real condition -- NOT a
+# replacement for the full 27-point robustness characterization
+# (experiments/pvt_sweep.py, docs/autockt-mapping.md sec 22), which remains
+# the authoritative PVT robustness record and is not re-run here.
+# ---------------------------------------------------------------------------
+
+PVT_CONDITION_SETS: dict[str, Optional[tuple[SimulationConditions, ...]]] = {
+    "none": None,
+    "smoke": (
+        SimulationConditions(ProcessCorner.TT, 27.0, 1.8),   # nominal
+        SimulationConditions(ProcessCorner.FF, 125.0, 1.71),  # sec 22's worst-case corner, now 27/27-confirmed
+    ),
+}
 
 
 # ---------------------------------------------------------------------------
@@ -352,6 +372,14 @@ def _main() -> int:
     parser.add_argument("--eval-seed", type=int, default=42)
     parser.add_argument("--randomize-initial-state", action="store_true", default=True)
     parser.add_argument("--initial-indices-source", choices=("verified", "grid-center"), default="verified")
+    parser.add_argument("--pvt-condition-set", choices=tuple(PVT_CONDITION_SETS), default="none",
+                         help="'none' (default, unchanged behavior): nominal-only selection, no PVT SPICE spent. "
+                              "'smoke': 2 conditions (nominal TT + one stress corner) -- enough to exercise the "
+                              "PVT-aware selection pathway with real SPICE without re-running the full 27-point "
+                              "robustness sweep (see experiments/pvt_sweep.py for that).")
+    parser.add_argument("--trade-off-preference", choices=("most_robust", "lowest_power", "strongest_eye_height",
+                                                             "widest_eye", "largest_margin", "balanced"),
+                         default="most_robust")
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--export-schematic", type=Path, default=None)
     args = parser.parse_args()
@@ -365,7 +393,10 @@ def _main() -> int:
         target=target, checkpoint_path=args.checkpoint, agent_seed=args.agent_seed, eval_seed=args.eval_seed,
         episodes=args.episodes, horizon=args.horizon, backend=args.backend,
         randomize_initial_state=args.randomize_initial_state,
-        initial_indices_source=args.initial_indices_source, export_schematic_to=args.export_schematic,
+        initial_indices_source=args.initial_indices_source,
+        pvt_conditions=PVT_CONDITION_SETS[args.pvt_condition_set],
+        trade_off_preference=args.trade_off_preference,
+        export_schematic_to=args.export_schematic,
     )
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(json.dumps(result, indent=2), encoding="utf-8")
