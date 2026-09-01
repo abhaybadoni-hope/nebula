@@ -1,0 +1,105 @@
+{
+  "trials": {
+    "warm_started_ppo_sec19": {
+      "description": "First cross-method trial. Random Search and CEM ran a fresh, unbiased n=20 one-shot budget each; PPO's row is instead the trivial-target-tagged SUBSET of a full mixed-target TRAINING run started from VERIFIED_INITIAL_PARAMETERS (itself derived from Random Search's own best result).",
+      "evaluation_budget": "Random Search / CEM: n=20 each, fixed in advance. PPO: 65 trivial-tagged steps out of a 95-evaluation, ~87-minute shared-weight training run (budget not separable from the interleaved hard-target training).",
+      "initialization": "Random Search: uniform over the full continuous [-1,1]^5 action space. CEM: Gaussian mean=0, std=2/sqrt(12) (unbiased). PPO: WARM-STARTED at VERIFIED_INITIAL_PARAMETERS, itself seeded from Random Search's own candidate_index 8 result -- not an independent starting point.",
+      "search_space": "Random Search/CEM: continuous [-1,1]^5. PPO: 21-point log-spaced discretized grid per parameter.",
+      "sequential_vs_one_shot": "Random Search/CEM: independent, i.i.d. one-shot draws. PPO: sequential, on-policy steps within a shared-weight training run, interleaved in real evaluation order with steps against a different (hard) target.",
+      "success_criterion": "autockt_reward >= 10.0 against TargetSpec.from_existing_thresholds() (the 'trivial' target), for every method.",
+      "comparable_across_methods": false,
+      "comparability_caveat": "PPO's number here is inflated by inheriting Random Search's own best-known starting point (confound), and its budget is not separable from a much larger multi-target training run. See the no_warm_start_headtohead_sec20 trial for the run that removes these confounds.",
+      "methods": {
+        "random_search": {
+          "source_file": "results/receiver_random_search_20_seed123.jsonl",
+          "n_evaluations": 20,
+          "native_success_rate": 0.05,
+          "uniform_success_rate": 0.05,
+          "uniform_evaluations_to_first_success": 9,
+          "best_uniform_reward": 10.0,
+          "wall_clock_total_s": null,
+          "wall_clock_available": false,
+          "caveats": [
+            "uniform sampling over the full normalized [-1,1]^5 action space (no bias toward any known-good region)"
+          ]
+        },
+        "cem": {
+          "source_file": "results/cem_unbiased_seed123.jsonl",
+          "n_evaluations": 20,
+          "native_success_rate": 0.0,
+          "uniform_success_rate": 0.0,
+          "uniform_evaluations_to_first_success": null,
+          "best_uniform_reward": -1.0,
+          "wall_clock_total_s": 630.274551998009,
+          "wall_clock_available": true,
+          "caveats": []
+        },
+        "ppo": {
+          "source_file": "results/autockt_mixed_target_confirmation.jsonl (trivial, target-filtered subset)",
+          "n_evaluations": 65,
+          "native_success_rate": 0.2,
+          "uniform_success_rate": null,
+          "uniform_evaluations_to_first_success": null,
+          "best_uniform_reward": null,
+          "wall_clock_total_s": null,
+          "wall_clock_available": false,
+          "caveats": [
+            "65/95 rows in this file matched target=trivial; steps are sequentially dependent within an episode, not i.i.d. candidates",
+            "evaluation order is real (interleaved with other-target steps in the source run when applicable), so 'evaluations to first success' here undercounts the true cumulative SPICE budget spent by that point"
+          ]
+        }
+      }
+    },
+    "no_warm_start_headtohead_sec20": {
+      "description": "Deliberate follow-up trial removing sec 19's own named confounds as far as possible without touching the locked PPO formulation: same n=20 budget, same centered/unbiased initial distribution, same seed=123, for all three methods.",
+      "evaluation_budget": "n=20 for all three methods, exactly (Random Search reused; CEM 4 iterations x population 5; PPO 4 updates x 5 episodes x horizon=1).",
+      "initialization": "All three centered/unbiased, not warm-started: Random Search uniform over [-1,1]^5 (unchanged); CEM Gaussian mean=0, std=2/sqrt(12); PPO grid-center (index 10 of 21 per parameter, the true geometric midpoint of each bound, confirmed structurally NOT equal to VERIFIED_INITIAL_PARAMETERS).",
+      "search_space": "Random Search/CEM: continuous [-1,1]^5. PPO: 21-point log-spaced discretized grid per parameter (unresolved structural difference, unchanged from sec 19).",
+      "sequential_vs_one_shot": "Random Search/CEM: independent, i.i.d. one-shot draws. PPO: horizon=1 (exactly one action-then-evaluate step per episode) -- the closest structurally honest match to a one-shot budget achievable without changing PPO's actual step/episode mechanics; still not identical (each PPO point is grid-center perturbed by at most one randomized index plus one further +/-1/+2 index-delta action, not a free draw anywhere in the space).",
+      "success_criterion": "autockt_reward >= 10.0 against TargetSpec.from_existing_thresholds() (the 'trivial' target), for every method -- unchanged from sec 19.",
+      "comparable_across_methods": true,
+      "comparability_caveat": "The closest fair trial this repo has run, but n=1 seed only (not a distribution) and the discretized-grid-vs-continuous-space and step-local-vs-global-draw structural differences remain unresolved. See docs/autockt-mapping.md sec 20 E for the full limitations list.",
+      "methods": {
+        "random_search": {
+          "source_file": "results/receiver_random_search_20_seed123.jsonl",
+          "n_evaluations": 20,
+          "native_success_rate": 0.05,
+          "uniform_success_rate": 0.05,
+          "uniform_evaluations_to_first_success": 9,
+          "best_uniform_reward": 10.0,
+          "wall_clock_total_s": null,
+          "wall_clock_available": false,
+          "caveats": [
+            "uniform sampling over the full normalized [-1,1]^5 action space (no bias toward any known-good region)"
+          ]
+        },
+        "cem": {
+          "source_file": "results/cem_graded_unbiased_seed123.jsonl",
+          "n_evaluations": 20,
+          "native_success_rate": 0.0,
+          "uniform_success_rate": 0.0,
+          "uniform_evaluations_to_first_success": null,
+          "best_uniform_reward": -1.0,
+          "wall_clock_total_s": 632.349467665772,
+          "wall_clock_available": true,
+          "caveats": []
+        },
+        "ppo": {
+          "source_file": "results/autockt_fair_headtohead_seed123.jsonl (trivial, target-filtered subset)",
+          "n_evaluations": 20,
+          "native_success_rate": 0.0,
+          "uniform_success_rate": null,
+          "uniform_evaluations_to_first_success": null,
+          "best_uniform_reward": null,
+          "wall_clock_total_s": null,
+          "wall_clock_available": false,
+          "caveats": [
+            "20/20 rows in this file matched target=trivial; steps are sequentially dependent within an episode, not i.i.d. candidates",
+            "evaluation order is real (interleaved with other-target steps in the source run when applicable), so 'evaluations to first success' here undercounts the true cumulative SPICE budget spent by that point"
+          ]
+        }
+      }
+    }
+  },
+  "conclusion": "Across both trials run this session, PPO shows no demonstrated practical advantage over Random Search on this specific circuit-sizing problem. The warm-started trial's apparently-higher PPO success rate is explained by starting from Random Search's own best-known point, not by independent search capability. The no-warm-start, budget-matched, same-seed trial found PPO and CEM both at 0/20 successes, against Random Search's 1/20 -- a result this repo's own analysis (docs/autockt-mapping.md sec 20 E) explicitly says lacks the statistical power (n=1 seed, ~5% base rate) to conclude anything about relative optimizer quality, and that primarily demonstrates PPO's reachability constraint under a short horizon and an unbiased start rather than a flaw in its learning algorithm. This module does not overturn or restate that conclusion differently -- it consolidates the same, already-verified numbers into one queryable, tested artifact."
+}

@@ -31,6 +31,7 @@ SPICE_FREE_MODULES = [
     "tests.test_final_specification",
     "tests.test_run_autockt_pipeline",
     "tests.test_learning_evidence",
+    "tests.test_benchmark_report",
 ]
 
 
