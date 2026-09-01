@@ -2,9 +2,13 @@
 
 Runnable from a clean checkout with one command:
 
-    python -m experiments.web_ui
+    python experiments/web_ui.py
 
-then open http://127.0.0.1:8765 in a browser.
+then open the URL it prints (http://127.0.0.1:8000 by default). Use
+--host/--port to change the bind address, e.g.
+`python experiments/web_ui.py --port 8001`. The server binds to
+127.0.0.1 by default and is not exposed externally unless --host is
+explicitly overridden.
 
 DESIGN: this server never imports or calls PPO/simulator/reward/PVT/
 candidate-selection code itself. Every "Run NEBULA" click launches the
@@ -29,6 +33,7 @@ never touched.
 
 from __future__ import annotations
 
+import argparse
 import json
 import re
 import subprocess
@@ -43,8 +48,8 @@ from urllib.parse import urlparse
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 RUNS_DIR = PROJECT_ROOT / "results" / "web_ui_runs"
-HOST = "127.0.0.1"
-DEFAULT_PORT = 8765
+HOST = "127.0.0.1"  # localhost-only default -- pass --host to expose beyond this machine
+DEFAULT_PORT = 8000
 TAIL_CHARS = 4000  # stdout/stderr tail kept per run, to bound memory/response size
 
 _RUNS: dict[str, dict[str, Any]] = {}
@@ -658,9 +663,40 @@ $('runBtn').addEventListener('click', () => {
 """
 
 
-def main() -> int:
-    server = ThreadingHTTPServer((HOST, DEFAULT_PORT), Handler)
-    print(f"NEBULA UI running at http://{HOST}:{DEFAULT_PORT}  (Ctrl+C to stop)")
+class ReusableThreadingHTTPServer(ThreadingHTTPServer):
+    """http.server.HTTPServer already sets allow_reuse_address = 1 (and
+    ThreadingHTTPServer inherits it), so SO_REUSEADDR is already active by
+    default -- this subclass just makes that explicit and pins it, so a
+    server that exited (cleanly or otherwise) never leaves the port
+    unusable for the next `python experiments/web_ui.py` invocation.
+    """
+
+    allow_reuse_address = True
+
+
+def _parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="NEBULA local UI server for experiments/run_autockt_pipeline.py.")
+    parser.add_argument("--host", default=HOST,
+                         help=f"bind address (default: {HOST}, localhost-only -- do not expose externally "
+                              "unless you specifically intend to)")
+    parser.add_argument("--port", type=int, default=DEFAULT_PORT, help=f"bind port (default: {DEFAULT_PORT})")
+    return parser.parse_args(argv)
+
+
+def build_server(host: str, port: int) -> ReusableThreadingHTTPServer:
+    """Constructs (and binds) the server without starting it -- separated
+    from main() so tests can verify host/port/reuse behavior without
+    calling the blocking serve_forever().
+    """
+
+    return ReusableThreadingHTTPServer((host, port), Handler)
+
+
+def main(argv: Optional[list[str]] = None) -> int:
+    args = _parse_args(argv)
+    server = build_server(args.host, args.port)
+    url = f"http://{args.host}:{args.port}"
+    print(f"NEBULA UI running at {url}  (Ctrl+C to stop)")
     try:
         server.serve_forever()
     except KeyboardInterrupt:

@@ -170,6 +170,99 @@ class ExecuteRunCrashHandlingTests(unittest.TestCase):
         self.assertIn("non-zero status (1)", payload["error"])
 
 
+class CliArgsTests(unittest.TestCase):
+    def test_default_host_and_port(self):
+        args = web_ui._parse_args([])
+        self.assertEqual(args.host, "127.0.0.1")
+        self.assertEqual(args.port, 8000)
+
+    def test_default_host_is_localhost_only(self):
+        # Requirement: the server must stay localhost-only unless the
+        # operator explicitly overrides --host.
+        self.assertEqual(web_ui.HOST, "127.0.0.1")
+        self.assertNotEqual(web_ui.HOST, "0.0.0.0")
+
+    def test_port_override_is_actually_used(self):
+        args = web_ui._parse_args(["--port", "8001"])
+        self.assertEqual(args.port, 8001)
+        self.assertEqual(args.host, "127.0.0.1")  # unchanged when only --port is given
+
+    def test_host_override(self):
+        args = web_ui._parse_args(["--host", "0.0.0.0", "--port", "9999"])
+        self.assertEqual(args.host, "0.0.0.0")
+        self.assertEqual(args.port, 9999)
+
+
+class ServerStartupAndReuseTests(unittest.TestCase):
+    def test_build_server_binds_the_requested_host_and_port(self):
+        server = web_ui.build_server("127.0.0.1", 0)
+        try:
+            self.assertEqual(server.server_address[0], "127.0.0.1")
+            self.assertGreater(server.server_address[1], 0)
+        finally:
+            server.server_close()
+
+    def test_server_class_has_reuse_address_enabled(self):
+        self.assertTrue(web_ui.ReusableThreadingHTTPServer.allow_reuse_address)
+
+    def test_port_can_be_rebound_immediately_after_close(self):
+        # Simulates "I stopped the server and want to relaunch on the same
+        # port right away" -- must not raise OSError: Address already in use.
+        first = web_ui.build_server("127.0.0.1", 0)
+        port = first.server_address[1]
+        first.server_close()
+
+        second = web_ui.build_server("127.0.0.1", port)
+        try:
+            self.assertEqual(second.server_address[1], port)
+        finally:
+            second.server_close()
+
+    def test_main_prints_the_exact_browser_url_and_returns_without_blocking(self):
+        # main() calls serve_forever(), which blocks -- patch it out so this
+        # test only exercises argument parsing, server construction, and
+        # the printed URL.
+        with patch.object(web_ui.ReusableThreadingHTTPServer, "serve_forever", return_value=None):
+            with patch("builtins.print") as mock_print:
+                rc = web_ui.main(["--port", "0"])
+        self.assertEqual(rc, 0)
+        printed = " ".join(str(c.args[0]) for c in mock_print.call_args_list)
+        self.assertIn("http://127.0.0.1:0", printed)
+
+
+class ManualTargetEntryUiIntactTests(unittest.TestCase):
+    """Guards the requirement that structured manual target-spec input
+    fields remain the primary interface (not replaced by anything
+    natural-language/LLM-based), and that they cover exactly the fields
+    TargetSpec actually supports -- no more, no less. TargetSpec (see
+    rl/target_spec.py) has exactly 4 fields: eye height, eye width,
+    margin, power. It has no peaking bounds -- peaking is a separate,
+    fixed downstream check (analysis/final_specification.py, 3-12 dB),
+    not a PPO target input -- so this UI correctly does not expose a
+    peaking input field, and this test guards against one being added
+    that wouldn't actually connect to anything.
+    """
+
+    def test_all_four_target_spec_fields_have_a_manual_input(self):
+        for field_id in ("tEyeHeight", "tEyeWidth", "tMargin", "tPower"):
+            self.assertIn(f'id="{field_id}"', web_ui.INDEX_HTML)
+
+    def test_manual_inputs_are_plain_number_fields_not_free_text_or_llm(self):
+        for field_id in ("tEyeHeight", "tEyeWidth", "tMargin", "tPower"):
+            start = web_ui.INDEX_HTML.index(f'id="{field_id}"')
+            snippet = web_ui.INDEX_HTML[max(0, start - 40):start + 60]
+            self.assertIn('type="number"', snippet)
+
+    def test_no_peaking_input_field_exists(self):
+        # TargetSpec has no peaking bounds -- a peaking input would be
+        # decorative and not wired to anything real.
+        self.assertNotIn('id="tPeaking', web_ui.INDEX_HTML)
+
+    def test_run_button_still_calls_the_existing_pipeline_api(self):
+        self.assertIn("'/api/run'", web_ui.INDEX_HTML)
+        self.assertIn("runBtn", web_ui.INDEX_HTML)
+
+
 class HttpIntegrationTests(unittest.TestCase):
     """Full request/response cycle over real HTTP, using --backend synthetic
     (no SPICE) end to end -- exercises the same code path a browser would.
@@ -177,7 +270,7 @@ class HttpIntegrationTests(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
-        cls.server = web_ui.ThreadingHTTPServer(("127.0.0.1", 0), web_ui.Handler)
+        cls.server = web_ui.build_server("127.0.0.1", 0)
         cls.port = cls.server.server_address[1]
         cls.thread = threading.Thread(target=cls.server.serve_forever, daemon=True)
         cls.thread.start()
