@@ -6,9 +6,74 @@ import argparse
 import json
 import math
 import random
+import time
 from pathlib import Path
 
 from simulator.rl_adapter import ReceiverRLAdapter
+from rl.autockt_env import metrics_from_observation
+from rl.autockt_state import lookup, signed_relative_error
+from rl.target_spec import SPEC_NAMES, TargetSpec
+
+# [NEBULA ADAPTATION] reward_v1 (simulator.rl_adapter.reward_v1, what CEM's
+# elite selection ranks candidates by, below) returns a FLAT -100.0 for
+# ANY simulator-stage failure, regardless of how close the candidate came
+# to passing -- see docs/autockt-mapping.md sec 19 for the confirmed
+# consequence (an unbiased-init CEM run's logged best_reward stayed at
+# exactly -100.0 across all iterations, elite selection choosing among
+# ties, std collapsing to its floor with no real gradient followed).
+#
+# GRADED_FITNESS_NO_INFORMATION_FLOOR / graded_cem_fitness below are an
+# OPTIONAL, additive alternative objective ONLY for elite selection
+# (--fitness graded) -- reward_v1 remains the default and is still what
+# gets logged as "reward"/used for reported success in every row either
+# way; this does not change what "success" means anywhere in the repo.
+# Mirrors rl.autockt_reward.autockt_reward's own unsatisfied-sum formula
+# (same lookup()/signed_relative_error() machinery, reused read-only, not
+# modified) but does NOT gate on `success` first, so a candidate that
+# fails only because of the TRAINING-fidelity margin>0 hard gate (i.e. its
+# `failure_stage` is "transient" -- the stage that actually computes eye
+# height/width/margin/receiver power, per simulator/receiver.py
+# ::_transient_violations) still contributes a graded score reflecting how
+# close it came, instead of the same flat floor as an early dc/ac/setup
+# failure. A design that never reaches the stage where those four metrics
+# are computed genuinely has no principled continuous measure of them
+# available -- GRADED_FITNESS_NO_INFORMATION_FLOOR is a fixed, disclosed
+# floor for that case, not an invented proxy.
+GRADED_FITNESS_NO_INFORMATION_FLOOR = -10.0
+# failure_stage values whose metrics dict actually contains real, non-zero-
+# filled height/width/margin/power measurements (see simulator/receiver.py
+# ::_transient_violations -- both the passing and the violating outcome of
+# that same stage compute and attach the full metrics dict).
+GRADED_FITNESS_RELIABLE_STAGES = (None, "transient")
+
+
+def graded_cem_fitness(metrics: dict, target: TargetSpec, failure_stage: str | None) -> float:
+    if failure_stage not in GRADED_FITNESS_RELIABLE_STAGES:
+        return GRADED_FITNESS_NO_INFORMATION_FLOOR
+    total = 0.0
+    for name in SPEC_NAMES:
+        relative_error = signed_relative_error(name, lookup(metrics.get(name, 0.0), getattr(target, name)))
+        if relative_error < 0:
+            total += relative_error
+    return total  # <= 0.0 always; 0.0 means every one of the 4 specs is at/above its target
+
+
+# [NEBULA ADAPTATION] the original, warm-started initialization: a Gaussian
+# centered near a known-good design (not the center of the normalized
+# action space) with a narrow std. Kept as the CLI default so existing
+# invocations/behavior are unchanged; --init-mean/--init-std (below) make
+# this overridable for an unbiased, uniform-search-comparable CEM run
+# without altering the algorithm itself (elite selection, mean/std update,
+# and the reward_v1 objective CEM ranks candidates by are all unchanged
+# either way).
+DEFAULT_INIT_MEAN = (
+    0.369674437322012,
+    0.27670652861099754,
+    0.33331526214636176,
+    0.7801971410738049,
+    -0.027727059712872038,
+)
+DEFAULT_INIT_STD = 0.15
 
 
 def main() -> int:
@@ -20,6 +85,33 @@ def main() -> int:
     parser.add_argument("--elite", type=int, default=2)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument(
+        "--init-mean", type=float, nargs=5, default=list(DEFAULT_INIT_MEAN),
+        help="[NEBULA ADAPTATION] initial Gaussian mean over the 5 normalized "
+        "action dimensions. Default matches the original warm-started values "
+        "(unchanged behavior); pass '0 0 0 0 0' for an unbiased, centered start.",
+    )
+    parser.add_argument(
+        "--init-std", type=float, nargs=5, default=[DEFAULT_INIT_STD] * 5,
+        help="[NEBULA ADAPTATION] initial per-dimension std. Default matches the "
+        "original narrow value (0.15); pass e.g. '0.577 ...' (Uniform(-1,1)'s own "
+        "std, 2/sqrt(12)) for first-generation coverage comparable to uniform sampling.",
+    )
+    parser.add_argument(
+        "--fitness", choices=("reward_v1", "graded"), default="reward_v1",
+        help="[NEBULA ADAPTATION] objective elite selection ranks candidates by. "
+        "'reward_v1' (default, unchanged behavior): simulator.rl_adapter.reward_v1, "
+        "flat -100.0 on any failure. 'graded': graded_cem_fitness (see module docstring) "
+        "-- gives informative signal among candidates that reach the transient stage. "
+        "Does NOT change what is logged as 'reward' or what counts as 'success' in the "
+        "output row (both remain reward_v1-based, unchanged) -- only what elite selection "
+        "optimizes toward.",
+    )
+    parser.add_argument(
+        "--target", choices=("trivial", "hard"), default="trivial",
+        help="[NEBULA ADAPTATION] only used when --fitness graded: which TargetSpec "
+        "graded_cem_fitness scores against.",
+    )
+    parser.add_argument(
         "--output",
         type=Path,
         default=Path("results/cem_training.jsonl"),
@@ -29,18 +121,13 @@ def main() -> int:
     if args.elite > args.population:
         raise ValueError("--elite cannot exceed --population")
 
+    target = TargetSpec.from_hard_target() if args.target == "hard" else TargetSpec.from_existing_thresholds()
+
     rng = random.Random(args.seed)
     env = ReceiverRLAdapter(seed=args.seed)
 
-    # Start with a broad distribution over normalized actions [-1, 1].
-    mean = [
-        0.369674437322012,
-        0.27670652861099754,
-        0.33331526214636176,
-        0.7801971410738049,
-        -0.027727059712872038,
-    ]
-    std = [0.15] * 5
+    mean = list(args.init_mean)
+    std = list(args.init_std)
 
     args.output.parent.mkdir(parents=True, exist_ok=True)
 
@@ -59,10 +146,18 @@ def main() -> int:
                     for i in range(5)
                 )
 
+                start_time = time.perf_counter()
                 step = env.step(action)
+                wall_clock_s = time.perf_counter() - start_time
                 evaluation_number += 1
 
-                candidates.append((step.reward, action))
+                metrics = metrics_from_observation(step.observation)
+                failure_stage = step.info.get("failure_stage")
+                if args.fitness == "graded":
+                    fitness_value = graded_cem_fitness(metrics, target, failure_stage)
+                else:
+                    fitness_value = step.reward
+                candidates.append((fitness_value, action))
 
                 if step.reward > best_reward:
                     best_reward = step.reward
@@ -75,7 +170,23 @@ def main() -> int:
                     "action": action,
                     "success": step.info.get("failure_stage") is None
                     and step.reward > -100.0,
-                    "failure_stage": step.info.get("failure_stage"),
+                    "failure_stage": failure_stage,
+                    "wall_clock_s": wall_clock_s,
+                    "parameters": step.info.get("parameters"),
+                    "evaluation_id": step.info.get("evaluation_id"),
+                    # [NEBULA ADAPTATION] reused, unmodified rl.autockt_env
+                    # helper -- reconstructs the metric-name -> value dict
+                    # from the adapter's own public observation tuple, the
+                    # same read-only reuse pattern rl/autockt_env.py already
+                    # uses. Does not change what CEM optimizes by default
+                    # (elite selection ranks by reward_v1 unless --fitness
+                    # graded is passed); this only makes post-hoc, uniform
+                    # re-scoring (e.g. against a TargetSpec threshold set)
+                    # possible from the logged output, which it previously
+                    # was not.
+                    "metrics": metrics,
+                    "fitness_kind": args.fitness,
+                    "fitness_value": fitness_value,
                 }
 
                 output.write(json.dumps(row) + "\n")
@@ -83,7 +194,8 @@ def main() -> int:
 
                 print(json.dumps(row), flush=True)
 
-            # Highest-reward actions become the next generation's center.
+            # Highest-FITNESS actions become the next generation's center
+            # (fitness_value == reward_v1 unless --fitness graded).
             candidates.sort(key=lambda item: item[0], reverse=True)
             elites = candidates[: args.elite]
 

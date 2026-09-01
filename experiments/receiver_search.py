@@ -12,6 +12,7 @@ from pathlib import Path
 import random
 import sys
 import tempfile
+import time
 from typing import Callable
 
 from simulator import (
@@ -431,10 +432,12 @@ def run_receiver_search(
         if index in completed:
             continue
         parameters: ReceiverParameters = normalized_action_to_parameters(action)
+        start_time = time.perf_counter()
         evaluation = evaluator(
             parameters, conditions, fidelity=fidelity, channel_path=channel_path,
             channel_port_map=channel_port_map, **effective_kwargs,
         )
+        wall_clock_s = time.perf_counter() - start_time
         row = {
             "candidate_index": index,
             "action": action,
@@ -449,6 +452,7 @@ def run_receiver_search(
                 violation for stage in evaluation.stages for violation in stage.violations
             ],
             "manifest_id": manifest["manifest_id"],
+            "wall_clock_s": wall_clock_s,
         }
         with destination.open("a", encoding="utf-8") as stream:
             stream.write(json.dumps(row, sort_keys=True, default=str) + "\n")
