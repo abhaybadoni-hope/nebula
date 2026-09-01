@@ -1909,11 +1909,53 @@ longer than surrounding passing points (~170-300s) in the same run,
 suggestive of retry/convergence difficulty rather than a clean threshold
 violation.
 
-**Confirmatory re-check launched before drawing a conclusion**: extended
-`experiments/pvt_sweep.py` with `--condition-set custom
---custom-conditions CORNER:VDD:TEMP ...` (7 new tests) to re-run the exact
-same 4 conditions through the IDENTICAL `evaluate_pvt_grid` code path the
-original sweep used (not the simpler direct-`evaluate_receiver` path
-`pvt_diagnose.py` uses), to rule out any script-level discrepancy before
-concluding non-reproducibility. Result: **[FILL IN AFTER
-`results/design_a_pvt_failure_reproduction_check.jsonl` completes]**.
+**Confirmatory re-check**: extended `experiments/pvt_sweep.py` with
+`--condition-set custom --custom-conditions CORNER:VDD:TEMP ...` (7 new
+tests) to re-run the exact same 4 conditions through the IDENTICAL
+`evaluate_pvt_grid` code path the original sweep used (not the simpler
+direct-`evaluate_receiver` path `pvt_diagnose.py` uses), to rule out any
+script-level discrepancy before concluding non-reproducibility.
+`results/design_a_pvt_failure_reproduction_check.jsonl`: **all 4/4
+succeeded again** (302.8s, 304.7s, 306.9s, 306.1s -- consistent,
+unremarkable timing, unlike the original run's erratic 288-677s spread).
+
+**Final confirmatory step: complete 27-point grid re-run, Design A
+completely unchanged.**
+`results/design_a_pvt_minimal27_rerun.jsonl` (new file; the original
+`results/design_a_pvt_minimal27.jsonl` was NOT overwritten and remains on
+disk as the historical first-run record) -- **27/27 (100%) pass**, 138.4
+minutes wall-clock, including every one of the 4 originally-failing
+conditions (FF at 1.71V/125C and all three temperatures of 1.80V), all now
+passing cleanly.
+
+### Task 1 conclusion
+
+**No R/C/bias parameter change was made or needed.** The evidence across
+three independent re-evaluations (single-point diagnosis with full
+per-stage detail, a 4-point reproduction check via the exact original code
+path, and a complete 27-point re-run) is unanimous and conclusive: **the
+original 23/27 result undersold Design A's actual robustness.** The 4
+original failures are best explained by transient-stage simulation-level
+non-reproducibility (consistent with their anomalously long, inconsistent
+original wall-clock times suggesting retry/convergence difficulty) at
+those specific corner/VDD/temperature combinations, not a stable,
+reproducible design weakness. Design A -- found by uniform Random Search
+at a single nominal condition, never PVT-aware, never modified by this
+investigation -- is **robust across the entire tested 27-point PVT space**
+on this clean re-run.
+
+**Both results are preserved, not silently replaced**: the original
+23/27 (`results/design_a_pvt_minimal27.jsonl`) remains on disk as the
+historical record that motivated this investigation; the 27/27 re-run
+(`results/design_a_pvt_minimal27_rerun.jsonl`) is the current,
+most-verified characterization of Design A's PVT robustness.
+`analysis/pvt_selection.py` (Task 4) should be pointed at the rerun file
+for any downstream selection decision, not the original.
+
+Per instruction ("do not blindly search forever," "if 27/27 is achieved:
+freeze the robust candidate, preserve Design A as baseline, document
+before/after"): **the robust candidate IS Design A itself, unchanged** --
+there is no "before/after design" distinction to draw, only a
+"before/after measurement" one. No local R/C search around Design A was
+run, because the diagnosis step (required before any search, per
+instruction) found no reproducible defect to search a fix for.

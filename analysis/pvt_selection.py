@@ -145,23 +145,35 @@ def select_final_designs(
 
 def _main() -> int:
     # Demonstration using ALREADY-COMPUTED, real PVT data -- zero new SPICE.
-    result = load_pvt_results_from_jsonl("design_a", "results/design_a_pvt_minimal27.jsonl")
-    print(json.dumps({
-        "design_id": result.design_id,
-        "n_conditions": result.n_conditions,
-        "n_passing": result.n_passing,
-        "pass_rate": result.pass_rate,
-        "worst_case_conditions": [
-            {"corner": p.process_corner, "vdd": p.supply_v, "temp_c": p.temperature_c,
-             "failed_stage": p.failed_stage}
-            for p in result.worst_case_conditions
-        ],
-    }, indent=2))
-    selected = select_final_designs([result], minimum_pass_rate=1.0, top_n=1)
-    print(json.dumps({
-        "selected": selected[0].design_id, "pass_rate": selected[0].pass_rate,
-        "met_minimum_pass_rate": selected[0].pass_rate >= 1.0,
-    }, indent=2))
+    # Both the original first-run result AND the later reproducibility-
+    # investigation re-run are shown -- the original is historical evidence
+    # (preserved, not overwritten or hidden) that motivated the diagnosis
+    # documented in docs/autockt-mapping.md sec 22 Task 1; the re-run is the
+    # current, most-verified characterization (see that section for why the
+    # two differ: simulation-level non-reproducibility at 4 points in the
+    # first run, not a design defect -- Design A itself was never changed).
+    for label, path in (
+        ("design_a (original first run)", "results/design_a_pvt_minimal27.jsonl"),
+        ("design_a (reproducibility re-run)", "results/design_a_pvt_minimal27_rerun.jsonl"),
+    ):
+        result = load_pvt_results_from_jsonl(label, path)
+        print(json.dumps({
+            "design_id": result.design_id,
+            "source": path,
+            "n_conditions": result.n_conditions,
+            "n_passing": result.n_passing,
+            "pass_rate": result.pass_rate,
+            "worst_case_conditions": [
+                {"corner": p.process_corner, "vdd": p.supply_v, "temp_c": p.temperature_c,
+                 "failed_stage": p.failed_stage}
+                for p in result.worst_case_conditions
+            ],
+        }, indent=2))
+        selected = select_final_designs([result], minimum_pass_rate=1.0, top_n=1)
+        print(json.dumps({
+            "selected": selected[0].design_id, "pass_rate": selected[0].pass_rate,
+            "met_minimum_pass_rate": selected[0].pass_rate >= 1.0,
+        }, indent=2))
     return 0
 
 

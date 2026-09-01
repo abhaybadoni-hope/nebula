@@ -60,6 +60,20 @@ class LoadFromRealDataTests(unittest.TestCase):
             self.assertEqual(point.process_corner, "ff")
             self.assertEqual(point.failed_stage, "transient")
 
+    def test_matches_the_reproducibility_rerun_27_of_27_result(self):
+        # docs/autockt-mapping.md sec 22 Task 1: the original 23/27 above
+        # was found to reflect simulation-level non-reproducibility at 4
+        # points, not a design defect -- Design A itself was never changed.
+        # Both results are preserved; this is the current, most-verified one.
+        path = REPOSITORY_ROOT / "results" / "design_a_pvt_minimal27_rerun.jsonl"
+        if not path.is_file():
+            self.skipTest("fixture not present")
+        result = load_pvt_results_from_jsonl("design_a", path)
+        self.assertEqual(result.n_conditions, 27)
+        self.assertEqual(result.n_passing, 27)
+        self.assertEqual(result.pass_rate, 1.0)
+        self.assertEqual(len(result.worst_case_conditions), 0)
+
 
 class RunPvtEvaluationTests(unittest.TestCase):
     def test_calls_evaluate_pvt_grid_with_the_given_conditions_and_summarizes(self):
