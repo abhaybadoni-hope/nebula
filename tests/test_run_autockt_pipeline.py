@@ -19,8 +19,10 @@ from rl.target_spec import TargetSpec
 from experiments.run_autockt_pipeline import (
     PipelineCandidate,
     _main,
+    _pvt_result_from_selection,
     filter_nominal_feasible,
     generate_candidates,
+    run_pipeline,
     select_final_design,
     validate_target,
 )
@@ -196,6 +198,61 @@ class SelectFinalDesignTests(unittest.TestCase):
         # 'most_robust' ignores trade-offs and returns the first by
         # robustness order among the tie -- pipeline_ep0.
         self.assertEqual(most_robust["selected"]["design_id"], "pipeline_ep0")
+
+
+class PvtResultFlowsIntoFinalSpecificationTests(unittest.TestCase):
+    """Integration requirement (NEXT IMPLEMENTATION CHUNK): the pipeline's
+    own real PVT result (if any) must reach the final specification
+    report's PVT row, not be silently dropped in favor of a fresh
+    'NOT CLAIMED' -- and must not require re-running PVT a second time to
+    get there.
+    """
+
+    def test_pvt_result_from_selection_reconstructs_the_summary(self):
+        selection = {
+            "selected": {"design_id": "x", "parameters": {}, "metrics": {}},
+            "pvt": {
+                "n_conditions": 4, "n_passing": 3, "pass_rate": 0.75,
+                "met_minimum_pass_rate": False,
+                "worst_case_conditions": [
+                    {"corner": "ff", "vdd": 1.71, "temp_c": 125.0, "failed_stage": "transient"},
+                ],
+            },
+        }
+        result = _pvt_result_from_selection(selection)
+        self.assertEqual(result.design_id, "x")
+        self.assertEqual((result.n_conditions, result.n_passing, result.pass_rate), (4, 3, 0.75))
+        self.assertEqual(len(result.worst_case_conditions), 1)
+        self.assertEqual(result.worst_case_conditions[0].failed_stage, "transient")
+
+    def test_no_pvt_selection_reconstructs_to_none(self):
+        self.assertIsNone(_pvt_result_from_selection({"selected": {"design_id": "x"}, "pvt": None}))
+
+    def test_run_pipeline_final_specification_reflects_real_pvt_result(self):
+        from simulator.config import ProcessCorner, SimulationConditions
+        from simulator.receiver import ReceiverEvaluation
+
+        conditions = (SimulationConditions(ProcessCorner.TT, 27.0, 1.8),
+                      SimulationConditions(ProcessCorner.FF, 125.0, 1.71))
+
+        def fake_evaluate_pvt_grid(parameters, *, conditions, fidelity):
+            return tuple(
+                ReceiverEvaluation(True, parameters, c, fidelity, (), {}, None, 0.0, "id", {})
+                for c in conditions
+            )
+
+        with patch("analysis.pvt_selection.evaluate_pvt_grid", side_effect=fake_evaluate_pvt_grid):
+            result = run_pipeline(
+                target=TargetSpec.from_existing_thresholds(), checkpoint_path=None,
+                agent_seed=1, eval_seed=1, episodes=8, horizon=1, backend="synthetic",
+                initial_indices_source="grid-center", pvt_conditions=conditions,
+            )
+
+        self.assertIsNotNone(result["selection"]["selected"])
+        pvt_row = next(r for r in result["final_specification"]["rows"] if r["metric"] == "PVT (pass/total)")
+        # must reflect the real 2-condition sweep, not "NOT CLAIMED".
+        self.assertEqual(pvt_row["measured"], "2/2")
+        self.assertEqual(pvt_row["verdict"], "PASS")
 
 
 class CLIIntegrationTests(unittest.TestCase):

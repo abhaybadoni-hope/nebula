@@ -43,6 +43,7 @@ from experiments.train_autockt import _resolve_initial_indices
 from analysis.design_catalog import FeasibleDesign, rank_by_measured_trade_offs
 from analysis.final_specification import build_final_specification_report, format_report
 from analysis.pvt_selection import (
+    PVTPointResult,
     PVTRobustnessResult,
     run_pvt_evaluation,
     select_with_trade_off_preference,
@@ -232,7 +233,8 @@ def select_final_design(
             "n_conditions": top.n_conditions, "n_passing": top.n_passing, "pass_rate": top.pass_rate,
             "met_minimum_pass_rate": top.pass_rate >= minimum_pass_rate,
             "worst_case_conditions": [
-                {"corner": p.process_corner, "vdd": p.supply_v, "temp_c": p.temperature_c}
+                {"corner": p.process_corner, "vdd": p.supply_v, "temp_c": p.temperature_c,
+                 "failed_stage": p.failed_stage}
                 for p in top.worst_case_conditions
             ],
         },
@@ -241,6 +243,35 @@ def select_final_design(
             f"trade_off_preference={trade_off_preference!r}"
         ),
     }
+
+
+def _pvt_result_from_selection(selection: dict[str, Any]) -> Optional[PVTRobustnessResult]:
+    """Reconstructs the PVTRobustnessResult select_final_design already
+    computed (real SPICE, if pvt_conditions was given) from its
+    JSON-serializable `selection["pvt"]` summary, so run_pipeline can feed
+    the SAME result into build_final_specification_report instead of
+    dropping it (or, worse, re-running PVT a second time to get an object
+    back). Only `worst_case_conditions`/summary fields are reconstructed --
+    `points` (the full per-condition list) is not part of the summary dict
+    and is not needed by build_final_specification_report/format_report,
+    which only read the summary fields.
+    """
+
+    pvt = selection.get("pvt")
+    if pvt is None:
+        return None
+    return PVTRobustnessResult(
+        design_id=selection["selected"]["design_id"],
+        n_conditions=pvt["n_conditions"], n_passing=pvt["n_passing"], pass_rate=pvt["pass_rate"],
+        worst_case_conditions=tuple(
+            PVTPointResult(
+                process_corner=w["corner"], supply_v=w["vdd"], temperature_c=w["temp_c"],
+                success=False, failed_stage=w.get("failed_stage"),
+            )
+            for w in pvt["worst_case_conditions"]
+        ),
+        points=(),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -303,7 +334,7 @@ def run_pipeline(
             parameters=selection["selected"]["parameters"],
             nominal_metrics=selection["selected"]["metrics"],
             nominal_source=f"pipeline run, backend={backend}, checkpoint={checkpoint_path}",
-            pvt_result=None,  # this run's own PVT (if any) is summarized in `selection["pvt"]` instead
+            pvt_result=_pvt_result_from_selection(selection),
         )
         result["final_specification"] = report
 
