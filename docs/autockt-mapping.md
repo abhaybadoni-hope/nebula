@@ -1959,3 +1959,144 @@ there is no "before/after design" distinction to draw, only a
 "before/after measurement" one. No local R/C search around Design A was
 run, because the diagnosis step (required before any search, per
 instruction) found no reproducible defect to search a fix for.
+
+## 23. NEXT IMPLEMENTATION CHUNK -- pipeline, final spec, PVT integration, learning evidence, benchmark
+
+Five tasks, executed in the reprioritized order (pipeline first, per a
+mid-chunk instruction, before returning to the final-spec/PVT/evidence/
+benchmark tasks). No PPO/simulator formulation change; no new real-SPICE
+experiment was run anywhere in this chunk -- every module here is either
+SPICE-free orchestration/consolidation over already-existing
+`results/*.jsonl` files, or (the pipeline's own tests) exercised with
+`--backend synthetic`.
+
+### Task 1: clean end-to-end pipeline
+
+`experiments/run_autockt_pipeline.py` -- wires `TargetSpec -> validate ->
+PPO deterministic rollout (real or synthetic backend, reusing
+`AutoCktReceiverEnv`/`PPOAgent`/`ReceiverRLAdapter` unmodified) ->
+`filter_nominal_feasible` -> PVT-aware `select_final_design` -> schematic
+export (`experiments.export_final_schematic`, unmodified) -> final
+specification report (`analysis.final_specification`, this chunk)` as one
+callable `run_pipeline()`, not disconnected scripts. 13 orchestration
+tests (`tests/test_run_autockt_pipeline.py`), including one full
+`--backend synthetic` CLI dry-run producing a real schematic + spec table
+with zero SPICE. Refuses to overwrite an existing `--output` file, same
+convention as every other experiment script in this repo.
+
+### Task 2: final specification table
+
+`analysis/final_specification.py` -- one authoritative report per design:
+for every official-brief metric this project actually measures somewhere,
+a `PASS`/`FAIL`/`NOT CLAIMED` row with the measured value, the required
+threshold, and the exact source file the number came from -- never
+inventing a missing measurement. Real output regenerated for Design A,
+`results/design_a_final_specification.json`, now including the real
+27/27 PVT result (`results/design_a_pvt_minimal27_rerun.jsonl`, sec 22
+Task 1):
+
+| Metric | Measured | Requirement | Verdict |
+|---|---:|---|---|
+| Eye width (UI) | 0.87 | > 0.4 UI | PASS |
+| Eye height (V) | 1.555 | > 0.1 V (this repo's own threshold, not independently re-verified against the slide's mV figure) | PASS |
+| Margin (V) | 0.525 | > 0 V | PASS |
+| Power (W) | 0.001085 | < 0.015 W | PASS |
+| Peaking (dB) | 7.07 | 3-12 dB | PASS |
+| HD3 (dB) | -79.93 | < -30 dB | PASS |
+| Input-referred noise (Vrms) | 0.000361 | < 0.0015 Vrms | PASS |
+| Transistor channel area (mm^2) | 3e-6 | < 0.05 mm^2 -- PARTIAL (channel area only) | NOT CLAIMED |
+| PVT (pass/total) | 27/27 | TT/SS/FF x VDD+/-5% x 0-125C | PASS |
+
+Design A clears every independently measurable spec; area remains
+honestly unclaimed (sec 22 Task 2 -- no resistor/capacitor/layout area
+model exists in this project).
+
+### Task 3: PVT-aware candidate selection -- integrated, not just built
+
+sec 22 Task 4 built the ranking logic
+(`analysis/pvt_selection.py::select_with_trade_off_preference`, the
+documented 4-level priority: nominal feasibility -> PVT pass rate ->
+robustness tie-break -> trade-off preference among genuine ties) but had
+not yet wired it INTO the pipeline. Two gaps found and closed this chunk:
+
+1. `run_autockt_pipeline.py::select_final_design`'s PVT branch was still
+   calling `rank_by_robustness` directly (priorities 1-3 only), never
+   reaching priority 4. Fixed: it now calls
+   `select_with_trade_off_preference` with a new, additive
+   `trade_off_preference` parameter (default `"most_robust"`, unchanged
+   behavior for existing callers). A new test constructs a genuine PVT
+   tie between two candidates differing only in `ctle_power_w` and
+   confirms `"lowest_power"` and `"most_robust"` select different designs
+   from the same tie.
+2. `run_pipeline` computed a real PVT result (real SPICE, when
+   `pvt_conditions` was supplied) but then passed `pvt_result=None` into
+   `build_final_specification_report` -- silently downgrading the final
+   spec's PVT row to `"NOT CLAIMED"` even though real per-condition data
+   existed one call frame away. Fixed with `_pvt_result_from_selection`,
+   which reconstructs the already-computed `PVTRobustnessResult` from
+   `select_final_design`'s own JSON-serializable summary -- no second PVT
+   run. Verified with an integration test (mocked `evaluate_pvt_grid`,
+   synthetic-backend candidate generation) confirming the final spec's
+   PVT row shows the real `2/2 PASS`, not `NOT CLAIMED`.
+
+### Task 4: strong learning/optimization evidence
+
+`analysis/learning_evidence.py` -- an independent, from-scratch
+recomputation (not a copy of prior narrative numbers) over the raw
+per-step rows of three already-existing training logs, reproducing sec
+15/17/18 exactly: matched-checkpoint initial-vs-final satisfaction/reward
+(single-target-hard: 0.667->1.0 satisfaction, 5.843->10.0 reward;
+mixed-target: 0.333->1.0, 1.509->10.0), the controlled unseen-target
+generalization win/tie/loss breakdown (1 win / 6 ties / 3 losses --
+correctly still reported as a REGRESSION, not an improvement), and the
+exact per-update mean-reward sequence from the mixed-target run (2.833,
+5.333, 2.333, 4.958, 4.667, 2.961 -- explicitly non-monotonic, with a
+regression test guarding against ever asserting a smooth curve).
+Parameter-behavior evidence (trained-vs-untrained action distributions,
+R/C counterfactual sweep) is deliberately left as a pointer to the
+already-existing, already-tested `analysis/policy_inspection.py` and sec
+17's sweep results, not duplicated.
+
+### Task 5: honest RS/CEM/PPO benchmark
+
+`analysis/benchmark_report.py` -- consolidates sec 19 (warm-started PPO)
+and sec 20 (no-warm-start, budget-matched head-to-head) into one tested,
+queryable artifact (`results/benchmark_report.json`), reusing
+`analysis/fair_comparison.py`'s existing summarizers (computes nothing
+new). Each trial explicitly states its evaluation budget, initialization,
+search space, sequential-vs-one-shot nature, success criterion, and
+whether it is genuinely comparable across methods:
+
+| trial | comparable | RS | CEM | PPO |
+|---|---|---:|---:|---:|
+| warm_started_ppo (sec 19) | **No** (PPO inherits RS's own best point; budget not separable from multi-target training) | 1/20 | 0/20 | 13/65 (per-step, native) |
+| no_warm_start_headtohead (sec 20) | **Yes**, but n=1 seed only | 1/20 | 0/20 | 0/20 |
+
+Conclusion text is unchanged from sec 20's own finding: **no demonstrated
+PPO advantage over Random Search once the warm-start confound is
+removed** -- this module does not overturn or restate that conclusion
+differently, only makes it queryable/testable.
+
+### Regression and commits
+
+261/261 SPICE-free tests passing (`tests/run_fast_suite.py`), up from 241
+at the start of this chunk. Six commits: `4c37bc8` (pipeline + final
+spec), `1145e25` (trade-off-preference ranking logic), `96a5f8a`
+(learning evidence), `8af566f` (benchmark report), `74fdc03` (PVT
+trade-off wiring into the pipeline), `0ae89ff` (PVT-result-into-final-spec
+wiring fix). Not yet pushed to `origin/main` as of this section (no push
+instruction given since the prior push, `209993f`).
+
+### What remains (per the chunk's own stopping rule)
+
+Every stopping-rule checklist item is satisfied: pipeline, final spec,
+PVT-aware selection integrated, learning evidence, RS/CEM/PPO benchmark,
+tests passing, documentation updated (this section). Explicitly NOT
+started, per the stopping rule: TD learning, actor-critic redesign,
+MA-Opt, surrogate RL, another PPO sweep, random hyperparameter search.
+Known, disclosed, unresolved limitations carried forward unchanged from
+earlier sections: PPO training-log wall-clock predates instrumentation
+for two of the three checkpoint-comparison files (sec 16); area is
+channel-only, not total circuit area (sec 22 Task 2); the RS/CEM/PPO
+head-to-head is a single seed, not a distribution (sec 20 E); `dfe_tap_v`
+remains behavioral, not a real SPICE element (sec 21).
