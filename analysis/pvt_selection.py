@@ -38,7 +38,7 @@ from typing import Optional
 from simulator.config import SimulationConditions
 from simulator.receiver import EvaluationFidelity, ReceiverParameters, evaluate_pvt_grid
 
-from analysis.design_catalog import FeasibleDesign
+from analysis.design_catalog import FeasibleDesign, rank_by_measured_trade_offs
 
 
 @dataclass(frozen=True)
@@ -141,6 +141,63 @@ def select_final_designs(
     ranked = rank_by_robustness(results)
     meeting_bar = [r for r in ranked if r.pass_rate >= minimum_pass_rate]
     return (meeting_bar or ranked)[:top_n]
+
+
+# [NEBULA ADAPTATION] documented, non-arbitrary selection priority (not a
+# weighted score): (1) nominal feasibility -- guaranteed by construction,
+# callers only pass PVTRobustnessResults for designs that already survived
+# nominal screening (analysis.design_catalog / pipeline filter_nominal_
+# feasible); (2) PVT pass_rate, highest first; (3) robustness tie-break,
+# n_conditions descending (more-evidenced ties beat less-evidenced ties);
+# (4) secondary trade-off preference among any PVT ties, via the ORIGINAL
+# design's own measured metrics (analysis.design_catalog.
+# rank_by_measured_trade_offs) -- never applied before priorities 1-3.
+TRADE_OFF_PREFERENCES = ("most_robust", "lowest_power", "strongest_eye_height", "widest_eye", "largest_margin", "balanced")
+
+
+def select_with_trade_off_preference(
+    pvt_results: list[PVTRobustnessResult],
+    designs: list[FeasibleDesign],
+    *,
+    preference: str = "most_robust",
+    minimum_pass_rate: float = 1.0,
+) -> Optional[PVTRobustnessResult]:
+    """Full 4-level, documented priority: nominal feasibility (guaranteed by
+    the caller only passing already-feasible designs/results) -> PVT pass
+    rate -> robustness tie-break -> secondary trade-off preference among
+    any remaining ties. `preference='most_robust'` (default) stops after
+    priority 3 (returns the single most-robust candidate, ignoring
+    trade-offs). Any other value in TRADE_OFF_PREFERENCES additionally
+    prefers, among designs SHARING THE TOP pass_rate, whichever one's own
+    measured metrics carry that trade-off label
+    (analysis.design_catalog.rank_by_measured_trade_offs) -- never
+    overriding a strictly higher pass_rate. Returns None if `pvt_results`
+    is empty.
+    """
+
+    if preference not in TRADE_OFF_PREFERENCES:
+        raise ValueError(f"unknown preference {preference!r}; choose from {TRADE_OFF_PREFERENCES}")
+    if not pvt_results:
+        return None
+
+    ranked = rank_by_robustness(pvt_results)
+    if preference == "most_robust":
+        return ranked[0]
+
+    top_pass_rate = ranked[0].pass_rate
+    tied = [r for r in ranked if r.pass_rate == top_pass_rate]
+    if len(tied) == 1:
+        return tied[0]
+
+    by_id = {d.design_id: d for d in designs}
+    tied_designs = [by_id[r.design_id] for r in tied if r.design_id in by_id]
+    if not tied_designs:
+        return tied[0]  # no metrics available to break the tie further -- first by robustness order
+
+    trade_off_ranked = rank_by_measured_trade_offs(tied_designs)
+    preferred = next((entry for entry in trade_off_ranked if preference in entry.trade_off_labels), None)
+    chosen_design_id = (preferred.design if preferred else trade_off_ranked[0].design).design_id
+    return next(r for r in tied if r.design_id == chosen_design_id)
 
 
 def _main() -> int:

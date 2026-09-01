@@ -20,6 +20,7 @@ from analysis.pvt_selection import (
     rank_by_robustness,
     run_pvt_evaluation,
     select_final_designs,
+    select_with_trade_off_preference,
     summarize_pvt_results,
 )
 
@@ -135,6 +136,64 @@ class RankAndSelectTests(unittest.TestCase):
         selected = select_final_designs([partial], minimum_pass_rate=1.0, top_n=1)
         self.assertEqual(len(selected), 1)  # still returns the best available, not empty
         self.assertLess(selected[0].pass_rate, 1.0)
+
+
+class SelectWithTradeOffPreferenceTests(unittest.TestCase):
+    """The full 4-level priority: nominal feasibility (guaranteed by only
+    passing already-feasible designs) -> PVT pass rate -> robustness
+    tie-break -> secondary trade-off preference among ties only.
+    """
+
+    def _design(self, design_id, power=0.001, height=1.0, width=0.5, margin=0.3):
+        return FeasibleDesign(
+            design_id=design_id, source_file="f", source_description="d",
+            parameters={"rload_ohm": 1000.0, "rdeg_ohm": 1000.0, "cdeg_f": 5e-13,
+                        "itail_a": 1e-4, "dfe_tap_v": 0.0},
+            metrics={"ctle_power_w": power, "dfe_locked_phase_eye_height_v": height,
+                     "dfe_eye_width_ui": width, "dfe_min_margin_v": margin},
+            native_reward=10.0, native_reward_scale="autockt_reward",
+        )
+
+    def test_higher_pass_rate_always_wins_regardless_of_preference(self):
+        low_power_low_robustness = summarize_pvt_results("low_power", [
+            PVTPointResult("tt", 1.8, 27.0, True, None),
+            PVTPointResult("ff", 1.71, 125.0, False, "transient"),
+        ])
+        high_power_high_robustness = summarize_pvt_results("high_power", [
+            PVTPointResult("tt", 1.8, 27.0, True, None),
+            PVTPointResult("ff", 1.71, 125.0, True, None),
+        ])
+        designs = [self._design("low_power", power=0.001), self._design("high_power", power=0.01)]
+        selected = select_with_trade_off_preference(
+            [low_power_low_robustness, high_power_high_robustness], designs, preference="lowest_power",
+        )
+        # high_power_high_robustness has the higher pass_rate -- preference
+        # must NOT override that, even though it asks for lowest_power.
+        self.assertEqual(selected.design_id, "high_power")
+
+    def test_trade_off_preference_breaks_a_genuine_pvt_tie(self):
+        tie_a = summarize_pvt_results("a", [PVTPointResult("tt", 1.8, 27.0, True, None)])
+        tie_b = summarize_pvt_results("b", [PVTPointResult("tt", 1.8, 27.0, True, None)])
+        designs = [self._design("a", power=0.01), self._design("b", power=0.001)]
+        selected = select_with_trade_off_preference([tie_a, tie_b], designs, preference="lowest_power")
+        self.assertEqual(selected.design_id, "b")
+
+    def test_most_robust_preference_ignores_trade_offs(self):
+        tie_a = summarize_pvt_results("a", [PVTPointResult("tt", 1.8, 27.0, True, None)])
+        tie_b = summarize_pvt_results("b", [PVTPointResult("tt", 1.8, 27.0, True, None)])
+        designs = [self._design("a", power=0.01), self._design("b", power=0.001)]
+        selected = select_with_trade_off_preference([tie_a, tie_b], designs, preference="most_robust")
+        self.assertEqual(selected.design_id, "a")  # first by robustness order, trade-offs never consulted
+
+    def test_empty_results_returns_none(self):
+        self.assertIsNone(select_with_trade_off_preference([], [], preference="most_robust"))
+
+    def test_unknown_preference_raises(self):
+        with self.assertRaises(ValueError):
+            select_with_trade_off_preference(
+                [summarize_pvt_results("a", [PVTPointResult("tt", 1.8, 27.0, True, None)])],
+                [self._design("a")], preference="not_a_real_preference",
+            )
 
 
 if __name__ == "__main__":
