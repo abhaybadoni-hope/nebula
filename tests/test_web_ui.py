@@ -263,6 +263,117 @@ class ManualTargetEntryUiIntactTests(unittest.TestCase):
         self.assertIn("runBtn", web_ui.INDEX_HTML)
 
 
+class SubprocessTimeoutTests(unittest.TestCase):
+    """FINAL AUDIT gap E: bounded outer-process handling for a HUNG (not
+    crashed) subprocess -- distinct from the SIGSEGV path above. Verifies
+    the subprocess is killed and reaped, and the run is reported as a
+    clean timeout, never retried automatically.
+    """
+
+    def test_hung_subprocess_is_killed_and_reported_as_a_timeout(self):
+        import subprocess as subprocess_module
+
+        run_id = "testrun_timeout_0000000000000"
+        with web_ui._RUNS_LOCK:
+            web_ui._RUNS[run_id] = {
+                "run_id": run_id, "status": "queued", "command": ["python", "-m", "x"],
+                "output_path": "/tmp/nope3.json", "schematic_path": "/tmp/nope3.spice",
+                "started_at": None, "finished_at": None, "returncode": None,
+                "error": None, "result": None, "stdout_tail": "", "stderr_tail": "",
+            }
+
+        mock_proc = MagicMock()
+        mock_proc.communicate.side_effect = [
+            subprocess_module.TimeoutExpired(cmd="x", timeout=web_ui.RUN_TIMEOUT_S),
+            ("partial output before the hang was killed", ""),
+        ]
+        mock_proc.returncode = -9  # SIGKILL, after proc.kill()
+
+        with patch("experiments.web_ui.subprocess.Popen", return_value=mock_proc):
+            web_ui._execute_run(run_id, ["python", "-m", "x"], Path("/tmp/nope3.json"), Path("/tmp/nope3.spice"))
+
+        mock_proc.kill.assert_called_once()
+        payload = web_ui._status_payload(run_id)
+        self.assertEqual(payload["status"], "failed")
+        self.assertIn("did not finish within", payload["error"])
+        self.assertIn("hang", payload["error"])
+        self.assertIn("partial output", payload["stdout_tail"])
+
+    def test_normal_completion_never_calls_kill(self):
+        run_id = "testrun_normal_00000000000000"
+        with web_ui._RUNS_LOCK:
+            web_ui._RUNS[run_id] = {
+                "run_id": run_id, "status": "queued", "command": ["python", "-m", "x"],
+                "output_path": "/tmp/nope4.json", "schematic_path": "/tmp/nope4.spice",
+                "started_at": None, "finished_at": None, "returncode": None,
+                "error": None, "result": None, "stdout_tail": "", "stderr_tail": "",
+            }
+        mock_proc = MagicMock()
+        mock_proc.communicate.return_value = ("", "")
+        mock_proc.returncode = 1
+        with patch("experiments.web_ui.subprocess.Popen", return_value=mock_proc):
+            web_ui._execute_run(run_id, ["python", "-m", "x"], Path("/tmp/nope4.json"), Path("/tmp/nope4.spice"))
+        mock_proc.kill.assert_not_called()
+
+
+class PvtOptionsMatchPipelineTests(unittest.TestCase):
+    """FINAL AUDIT gap D: web_ui.py deliberately keeps its own plain-string
+    PVT_CONDITION_SETS tuple (not an import of run_autockt_pipeline, so
+    this lightweight server never has to import torch/simulator/rl at
+    startup) -- this test is the drift guard that relationship needs.
+    """
+
+    def test_web_ui_pvt_options_match_the_pipelines_own_condition_sets(self):
+        from experiments.run_autockt_pipeline import PVT_CONDITION_SETS as pipeline_sets
+        self.assertEqual(set(web_ui.PVT_CONDITION_SETS), set(pipeline_sets.keys()))
+
+    def test_none_is_still_valid_and_first(self):
+        self.assertEqual(web_ui.PVT_CONDITION_SETS[0], "none")
+
+    def test_minimal27_is_exposed(self):
+        self.assertIn("minimal27", web_ui.PVT_CONDITION_SETS)
+
+
+class Hd3NoiseUiTests(unittest.TestCase):
+    def test_checkbox_exists_and_is_wired_to_the_flag(self):
+        self.assertIn('id="measureHd3Noise"', web_ui.INDEX_HTML)
+        self.assertIn("measure_hd3_noise: $('measureHd3Noise').checked", web_ui.INDEX_HTML)
+
+    def test_build_argv_passes_the_flag_only_when_requested(self):
+        base = {"target_mode": "trivial", "backend": "real", "episodes": 1, "horizon": 1,
+                "pvt_condition_set": "none", "trade_off_preference": "most_robust"}
+        argv_off = web_ui._build_argv(base, output_path=Path("/tmp/x.json"), schematic_path=Path("/tmp/x.spice"))
+        self.assertNotIn("--measure-hd3-noise", argv_off)
+
+        argv_on = web_ui._build_argv(
+            {**base, "measure_hd3_noise": True}, output_path=Path("/tmp/x.json"), schematic_path=Path("/tmp/x.spice"),
+        )
+        self.assertIn("--measure-hd3-noise", argv_on)
+
+
+class PvtLabelingHonestyTests(unittest.TestCase):
+    """FINAL AUDIT gap D wording audit: no UI text may imply that
+    nominal-only ("none") or "smoke" selection constitutes PVT robustness.
+    """
+
+    def test_none_option_explicitly_says_nominal_only(self):
+        self.assertIn("NOMINAL-ONLY", web_ui.INDEX_HTML)
+
+    def test_smoke_option_explicitly_disclaims_being_a_robustness_proof(self):
+        idx = web_ui.INDEX_HTML.index('value="smoke"')
+        snippet = web_ui.INDEX_HTML[idx:idx + 200]
+        self.assertIn("not a robustness proof", snippet)
+
+    def test_full_sweep_option_is_labeled_with_its_real_cost(self):
+        idx = web_ui.INDEX_HTML.index('value="minimal27"')
+        snippet = web_ui.INDEX_HTML[idx:idx + 200]
+        self.assertIn("SLOW", snippet)
+        self.assertIn("27-point", snippet)
+
+    def test_hint_text_states_none_and_smoke_do_not_establish_robustness(self):
+        self.assertIn("do NOT establish PVT robustness", web_ui.INDEX_HTML)
+
+
 class HttpIntegrationTests(unittest.TestCase):
     """Full request/response cycle over real HTTP, using --backend synthetic
     (no SPICE) end to end -- exercises the same code path a browser would.

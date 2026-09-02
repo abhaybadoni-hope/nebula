@@ -51,13 +51,29 @@ RUNS_DIR = PROJECT_ROOT / "results" / "web_ui_runs"
 HOST = "127.0.0.1"  # localhost-only default -- pass --host to expose beyond this machine
 DEFAULT_PORT = 8000
 TAIL_CHARS = 4000  # stdout/stderr tail kept per run, to bound memory/response size
+# FINAL AUDIT gap E: bounded outer-process handling for a hung (not
+# crashed) pipeline subprocess. A SIGSEGV already terminates the
+# subprocess immediately and is handled below without any timeout; this
+# guards the separate risk of a subprocess that never returns at all
+# (e.g. a wedged ngspice process). Generous enough not to interrupt a
+# legitimate --pvt-condition-set minimal27 run (~121.8 min historically
+# for one design's 27-point sweep, docs/autockt-mapping.md sec 22, times
+# however many nominally-feasible candidates reach that stage) while
+# still catching a genuine hang rather than waiting forever.
+RUN_TIMEOUT_S = 7200.0  # 2 hours
 
 _RUNS: dict[str, dict[str, Any]] = {}
 _RUNS_LOCK = threading.Lock()
 
 TARGET_MODES = ("trivial", "hard", "custom")
 BACKENDS = ("synthetic", "real")
-PVT_CONDITION_SETS = ("none", "smoke")
+# Kept as a plain string tuple (not imported from experiments.run_autockt_
+# pipeline) so this server never has to import torch/simulator/rl at
+# startup -- see the module docstring's design note. Cross-checked against
+# the pipeline's own PVT_CONDITION_SETS keys by
+# tests/test_web_ui.py::PvtOptionsMatchPipelineTests so the two cannot
+# silently drift apart.
+PVT_CONDITION_SETS = ("none", "smoke", "minimal27")
 TRADE_OFF_PREFERENCES = (
     "most_robust", "lowest_power", "strongest_eye_height", "widest_eye", "largest_margin", "balanced",
 )
@@ -130,6 +146,8 @@ def _build_argv(payload: dict[str, Any], *, output_path: Path, schematic_path: P
         argv += ["--target-mode", payload["target_mode"]]
     if payload.get("checkpoint"):
         argv += ["--checkpoint", payload["checkpoint"]]
+    if payload.get("measure_hd3_noise"):
+        argv += ["--measure-hd3-noise"]
     return argv
 
 
@@ -138,12 +156,19 @@ def _execute_run(run_id: str, argv: list[str], output_path: Path, schematic_path
         _RUNS[run_id]["status"] = "running"
         _RUNS[run_id]["started_at"] = time.monotonic()
 
+    timed_out = False
     try:
         proc = subprocess.Popen(
             argv, cwd=PROJECT_ROOT, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
         )
-        stdout, stderr = proc.communicate()
-        returncode = proc.returncode
+        try:
+            stdout, stderr = proc.communicate(timeout=RUN_TIMEOUT_S)
+            returncode = proc.returncode
+        except subprocess.TimeoutExpired:
+            timed_out = True
+            proc.kill()
+            stdout, stderr = proc.communicate()  # reap the now-terminated process, collect whatever it wrote
+            returncode = proc.returncode
         launch_error: Optional[str] = None
     except OSError as exc:
         stdout, stderr, returncode = "", "", None
@@ -161,6 +186,13 @@ def _execute_run(run_id: str, argv: list[str], output_path: Path, schematic_path
         if launch_error is not None:
             entry["status"] = "failed"
             entry["error"] = launch_error
+        elif timed_out:
+            entry["status"] = "failed"
+            entry["error"] = (
+                f"the pipeline subprocess did not finish within {RUN_TIMEOUT_S / 60:.0f} minutes and was "
+                "killed (not a crash -- a hang, e.g. a wedged ngspice process). This was NOT retried "
+                "automatically. If this is unexpected for the configuration you ran, investigate before retrying."
+            )
         elif returncode == 0 and output_path.is_file():
             try:
                 entry["result"] = json.loads(output_path.read_text(encoding="utf-8"))
@@ -425,15 +457,24 @@ INDEX_HTML = r"""<!doctype html>
         <option value="verified">Verified (warm start)</option>
         <option value="grid-center">Grid center (unbiased)</option>
       </select>
+      <label style="display:flex; align-items:center; gap:8px; margin-top:12px; cursor:pointer">
+        <input id="measureHd3Noise" type="checkbox" style="width:auto">
+        <span style="margin:0">Measure HD3 &amp; input-referred noise (real backend only)</span>
+      </label>
+      <p class="hint">Runs one extra real-SPICE evaluation (FINAL fidelity) of the selected design.
+        Off by default: adds real SPICE time; without it, HD3/noise show as NOT CLAIMED.</p>
     </fieldset>
 
     <fieldset>
       <legend>PVT-aware selection</legend>
       <label for="pvtSet">Condition set</label>
       <select id="pvtSet">
-        <option value="none">None (nominal-only selection)</option>
-        <option value="smoke">Smoke (2 conditions: nominal + stress corner)</option>
+        <option value="none">None -- NOMINAL-ONLY (not PVT-robust; only TT/1.8V/27C is checked)</option>
+        <option value="smoke">Smoke -- 2 conditions (nominal + 1 stress corner; not a robustness proof)</option>
+        <option value="minimal27">Full 27-point sweep -- TT/SS/FF x VDD+/-5% x 0-125C (SLOW, ~2h/design)</option>
       </select>
+      <p class="hint">"None" and "smoke" do NOT establish PVT robustness -- only "Full 27-point sweep" does
+        (see docs/autockt-mapping.md sec 22's 27/27 result). The manual real-SPICE demo run used "None".</p>
       <label for="tradeOff">Trade-off preference (used on PVT ties)</label>
       <select id="tradeOff">
         <option value="most_robust">Most robust</option>
@@ -521,6 +562,7 @@ function buildPayload() {
     initial_indices_source: $('initSource').value,
     pvt_condition_set: $('pvtSet').value,
     trade_off_preference: $('tradeOff').value,
+    measure_hd3_noise: $('measureHd3Noise').checked,
   };
   if (targetMode === 'custom') {
     payload.target = {
