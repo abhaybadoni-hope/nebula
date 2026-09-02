@@ -1,6 +1,7 @@
 # Simulation outputs
 *.txt
 !requirements.txt
+!artifacts/PHASE2_SHA256SUMS.txt
 *.log
 *.raw
 results/*.jsonl

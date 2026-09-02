@@ -563,3 +563,42 @@ before selecting or training a reinforcement-learning algorithm. Full Stage 2 wo
 includes a physical bias/tail source, sampler and DFE, MOS sizing groups,
 parasitics, and layout-grounded area/power. The complete decision and
 deferred-work ledger is in `docs/stage1-decisions.md`.
+
+## Phase 2 — Experimental Artifacts & Reproducibility
+
+A complete, byte-for-byte experimental artifact package is available for
+anyone reviewing the reported PPO/Random-Search/CEM/PVT results and the
+current competition/demo pipeline:
+
+- **Package**: [`artifacts/NEBULA_phase2_experimental_artifacts.zip`](artifacts/NEBULA_phase2_experimental_artifacts.zip)
+- **Index**: [`artifacts/PHASE2_ARTIFACT_INDEX.md`](artifacts/PHASE2_ARTIFACT_INDEX.md) — per-file experiment, purpose, status, seed, and relationship to each reported result
+- **Machine-readable manifest**: [`artifacts/PHASE2_ARTIFACT_MANIFEST.json`](artifacts/PHASE2_ARTIFACT_MANIFEST.json)
+- **Checksums**: [`artifacts/PHASE2_SHA256SUMS.txt`](artifacts/PHASE2_SHA256SUMS.txt) — SHA-256 for every file in the ZIP
+
+**What's included**: all PPO/Random Search/CEM logs (including the incomplete,
+warm-started `cem_baseline_3x10.jsonl`, kept and explicitly labeled — never
+treated as a fair benchmark), the mixed-target/single-target PPO learning
+checkpoint, PVT original run, diagnosis, targeted reproduction check, and
+final full rerun, exported schematics, channel inputs, circuit configs,
+the feasible-design catalog, three real-SPICE SIGSEGV crash logs (with the
+partial fault-handler trace that identified the likely root cause), the
+successful real-SPICE UI run (`run_id ed91dd5617fa4c99b9539931c1c25ed6`),
+and the complete current pipeline/UI source (`experiments/web_ui.py`,
+`experiments/run_autockt_pipeline.py`, and every RL/simulator/analysis
+module they depend on) plus their tests.
+
+**PVT evidence, preserved as a sequence, not replaced**:
+
+1. Original minimal-27 sweep — **23/27 PASS** (`results/design_a_pvt_minimal27.jsonl`, kept unmodified on disk)
+2. Targeted diagnosis of the 4 failing conditions
+3. Targeted reproduction check — **4/4 PASS**
+4. Complete 27-point rerun — **27/27 PASS** (`results/design_a_pvt_minimal27_rerun.jsonl`, a separate file — the original 23/27 was never overwritten)
+
+**Guarantees**:
+- No historical experiment file was modified, regenerated, or deleted to build this package.
+- Failed and incomplete runs are preserved, not hidden (three SIGSEGV crash logs, one incomplete/warm-started CEM run).
+- Missing metadata (commands, seeds, versions) is marked `NOT RECORDED` in the index — never guessed or reconstructed and presented as exact.
+- No new experiment was run to produce this package; it packages what already existed.
+
+See `docs/FINAL_TECHNICAL_AUDIT.md` for the full narrative interpretation
+of these results (what can and cannot be honestly claimed from them).
