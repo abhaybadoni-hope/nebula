@@ -17,11 +17,13 @@ from unittest.mock import patch
 from rl.target_spec import TargetSpec
 
 from experiments.run_autockt_pipeline import (
+    PVT_CONDITION_SETS,
     PipelineCandidate,
     _main,
     _pvt_result_from_selection,
     filter_nominal_feasible,
     generate_candidates,
+    measure_hd3_and_noise,
     run_pipeline,
     select_final_design,
     validate_target,
@@ -253,6 +255,124 @@ class PvtResultFlowsIntoFinalSpecificationTests(unittest.TestCase):
         # must reflect the real 2-condition sweep, not "NOT CLAIMED".
         self.assertEqual(pvt_row["measured"], "2/2")
         self.assertEqual(pvt_row["verdict"], "PASS")
+
+
+class MeasureHd3AndNoiseTests(unittest.TestCase):
+    """FINAL AUDIT gaps A/B: HD3 and input-referred-noise refinement.
+    simulator.receiver.evaluate_receiver is mocked -- SPICE-free -- to
+    verify the wiring; the real measurement itself is exercised
+    separately (see docs/FINAL_TECHNICAL_AUDIT.md for the one real-SPICE
+    validation run against Design A).
+    """
+
+    PARAMS = {"rload_ohm": 1000.0, "rdeg_ohm": 1000.0, "cdeg_f": 5e-13, "itail_a": 1e-4, "dfe_tap_v": 0.0}
+
+    def test_success_returns_hd3_and_noise_metrics(self):
+        from simulator.receiver import EvaluationFidelity, ReceiverEvaluation, ReceiverParameters
+
+        fake_metrics = {"hd3_db": -45.2, "input_referred_noise_vrms": 0.0008, "dfe_eye_width_ui": 0.8}
+
+        def fake_evaluate_receiver(parameters, conditions, fidelity):
+            self.assertEqual(fidelity, EvaluationFidelity.FINAL)
+            return ReceiverEvaluation(True, parameters, conditions, fidelity, (), fake_metrics,
+                                       None, 120.0, "id", {})
+
+        with patch("experiments.run_autockt_pipeline.evaluate_receiver", side_effect=fake_evaluate_receiver):
+            result = measure_hd3_and_noise(self.PARAMS)
+
+        self.assertTrue(result["success"])
+        self.assertEqual(result["metrics"]["hd3_db"], -45.2)
+        self.assertEqual(result["metrics"]["input_referred_noise_vrms"], 0.0008)
+        self.assertIsNone(result["failed_stage"])
+
+    def test_failure_reports_failed_stage_not_a_fabricated_value(self):
+        from simulator.receiver import EvaluationFidelity, ReceiverEvaluation
+
+        def fake_evaluate_receiver(parameters, conditions, fidelity):
+            return ReceiverEvaluation(False, parameters, conditions, fidelity, (), {"dc_ok": 0.0},
+                                       "hd3", 30.0, "id", {})
+
+        with patch("experiments.run_autockt_pipeline.evaluate_receiver", side_effect=fake_evaluate_receiver):
+            result = measure_hd3_and_noise(self.PARAMS)
+
+        self.assertFalse(result["success"])
+        self.assertEqual(result["failed_stage"], "hd3")
+        self.assertNotIn("hd3_db", result["metrics"])
+
+
+class RunPipelineHd3NoiseRefinementTests(unittest.TestCase):
+    def _feasible_candidates(self):
+        return [PipelineCandidate(
+            0, {"rload_ohm": 1000.0, "rdeg_ohm": 1000.0, "cdeg_f": 5e-13, "itail_a": 1e-4, "dfe_tap_v": 0.0},
+            {"ctle_power_w": 0.001, "dfe_locked_phase_eye_height_v": 1.0, "dfe_eye_width_ui": 0.5,
+             "dfe_min_margin_v": 0.3}, 10.0, True, 1,
+        )]
+
+    def test_refinement_merges_hd3_noise_into_the_final_specification(self):
+        from simulator.receiver import EvaluationFidelity, ReceiverEvaluation
+
+        def fake_evaluate_receiver(parameters, conditions, fidelity):
+            return ReceiverEvaluation(True, parameters, conditions, fidelity, (),
+                                       {"hd3_db": -40.0, "input_referred_noise_vrms": 0.0005},
+                                       None, 90.0, "id", {})
+
+        with patch("experiments.run_autockt_pipeline.generate_candidates", return_value=self._feasible_candidates()):
+            with patch("experiments.run_autockt_pipeline.evaluate_receiver", side_effect=fake_evaluate_receiver):
+                result = run_pipeline(
+                    target=TargetSpec.from_existing_thresholds(), checkpoint_path=None, backend="real",
+                    measure_hd3_noise_flag=True,
+                )
+
+        self.assertTrue(result["hd3_noise_refinement"]["attempted"])
+        self.assertTrue(result["hd3_noise_refinement"]["success"])
+        hd3_row = next(r for r in result["final_specification"]["rows"] if r["metric"] == "HD3 (dB)")
+        self.assertEqual(hd3_row["verdict"], "PASS")
+        noise_row = next(r for r in result["final_specification"]["rows"]
+                          if r["metric"] == "Input-referred noise (Vrms)")
+        self.assertEqual(noise_row["verdict"], "PASS")
+
+    def test_flag_off_by_default_leaves_hd3_noise_not_claimed(self):
+        with patch("experiments.run_autockt_pipeline.generate_candidates", return_value=self._feasible_candidates()):
+            result = run_pipeline(target=TargetSpec.from_existing_thresholds(), checkpoint_path=None, backend="real")
+
+        self.assertNotIn("hd3_noise_refinement", result)
+        hd3_row = next(r for r in result["final_specification"]["rows"] if r["metric"] == "HD3 (dB)")
+        self.assertEqual(hd3_row["verdict"], "NOT CLAIMED")
+
+    def test_flag_is_a_no_op_for_synthetic_backend(self):
+        with patch("experiments.run_autockt_pipeline.generate_candidates", return_value=self._feasible_candidates()):
+            result = run_pipeline(
+                target=TargetSpec.from_existing_thresholds(), checkpoint_path=None, backend="synthetic",
+                measure_hd3_noise_flag=True,
+            )
+        self.assertFalse(result["hd3_noise_refinement"]["attempted"])
+
+
+class PvtConditionSetsAuditTests(unittest.TestCase):
+    """FINAL AUDIT gap D: full PVT must be an explicit, non-default,
+    non-automatic option that reuses (not duplicates) the authoritative
+    27-point set experiments/pvt_sweep.py already defines.
+    """
+
+    def test_none_is_still_the_default_no_pvt_spent(self):
+        self.assertIsNone(PVT_CONDITION_SETS["none"])
+
+    def test_minimal27_is_present_and_has_27_conditions(self):
+        self.assertIn("minimal27", PVT_CONDITION_SETS)
+        self.assertEqual(len(PVT_CONDITION_SETS["minimal27"]), 27)
+
+    def test_minimal27_is_the_same_object_as_pvt_sweeps_own_set(self):
+        from experiments import pvt_sweep
+        self.assertEqual(PVT_CONDITION_SETS["minimal27"], pvt_sweep.MINIMAL_27_CONDITIONS)
+
+    def test_cli_default_pvt_condition_set_is_still_none(self):
+        with TemporaryDirectory() as tmp:
+            output = Path(tmp) / "result.json"
+            argv = ["run_autockt_pipeline.py", "--backend", "synthetic", "--episodes", "1", "--output", str(output)]
+            with patch("sys.argv", argv):
+                _main()
+            result = json.loads(output.read_text(encoding="utf-8"))
+        self.assertIsNone(result["selection"]["pvt"])
 
 
 class CLIIntegrationTests(unittest.TestCase):

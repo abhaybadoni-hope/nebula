@@ -19,6 +19,33 @@ synthetic-backend testing only) a freshly-constructed, untrained policy --
 
 from __future__ import annotations
 
+import os
+
+# FINAL AUDIT gap E: must be set before numpy is imported (transitively,
+# by the `from simulator...` imports below) to take effect. This process
+# links numpy against Apple's Accelerate framework (ACCELERATE_NEW_LAPACK,
+# confirmed via numpy.show_config() on this checkout's arm64 build), a
+# combination with documented threading/reentrancy crash reports on
+# Apple Silicon -- and this SAME process also loads PyTorch (imported
+# below), which runs its own separate thread pool. A real, captured
+# faulthandler traceback from one of this session's real-SPICE SIGSEGV
+# crashes showed the fault inside numpy/linalg/_linalg.py, called from
+# simulator/waveform.py::hd3_db's numpy.linalg.cond/lstsq (used by the
+# HD3 measurement stage, simulator/receiver.py::_run_hd3) -- exactly the
+# kind of call Accelerate's threading has been reported to fault on when
+# another thread pool is active in the same process. Pinning BLAS/LAPACK
+# to a single thread removes that race without changing any simulator
+# math, algorithm, or numeric result -- an environment/process-level
+# mitigation, not a change to simulator/waveform.py itself. setdefault()
+# so an operator's own explicit choice is never overridden. Not proven to
+# eliminate the crash (the failure was already known to be rare/
+# intermittent, so absence of further crashes cannot be proven from a
+# small number of trials) -- see docs/FINAL_TECHNICAL_AUDIT.md sec 4.E.
+os.environ.setdefault("VECLIB_MAXIMUM_THREADS", "1")
+os.environ.setdefault("OMP_NUM_THREADS", "1")
+os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
+os.environ.setdefault("MKL_NUM_THREADS", "1")
+
 import argparse
 import json
 import math
@@ -29,6 +56,7 @@ from typing import Any, Optional
 import torch
 
 from simulator.config import ProcessCorner, SimulationConditions
+from simulator.receiver import EvaluationFidelity, ReceiverParameters, evaluate_receiver
 from simulator.rl_adapter import ReceiverRLAdapter, RLBudget
 
 from rl.autockt_env import AutoCktReceiverEnv
@@ -38,6 +66,7 @@ from rl.ppo_agent import PPOAgent
 from rl.synthetic_benchmark import synthetic_evaluate_receiver
 from rl.target_spec import SPEC_NAMES, TargetSpec
 
+from experiments import pvt_sweep
 from experiments.export_final_schematic import render_final_schematic
 from experiments.train_autockt import _resolve_initial_indices
 
@@ -55,10 +84,15 @@ from analysis.pvt_selection import (
 # CLI-only: named PVT condition sets (mirrors experiments/pvt_sweep.py's
 # --condition-set pattern). "smoke" is intentionally the smallest set that
 # still exercises the PVT-aware SELECTION LOGIC (pass-rate ranking, tie-break,
-# trade-off preference) with more than one real condition -- NOT a
-# replacement for the full 27-point robustness characterization
-# (experiments/pvt_sweep.py, docs/autockt-mapping.md sec 22), which remains
-# the authoritative PVT robustness record and is not re-run here.
+# trade-off preference) with more than one real condition. "minimal27"
+# reuses experiments/pvt_sweep.py's own MINIMAL_27_CONDITIONS (the SAME
+# 27-point set behind docs/autockt-mapping.md sec 22's 27/27 result) --
+# it is exposed here as an explicit, opt-in choice so full PVT robustness
+# checking is reachable from this pipeline/UI, but "none" stays the
+# default and nothing here ever selects or runs it automatically. At
+# ~121.8 min historically for one design (sec 22), it is exponentially
+# more expensive per nominally-feasible candidate than "smoke" and should
+# be chosen deliberately, not by default.
 # ---------------------------------------------------------------------------
 
 PVT_CONDITION_SETS: dict[str, Optional[tuple[SimulationConditions, ...]]] = {
@@ -67,6 +101,7 @@ PVT_CONDITION_SETS: dict[str, Optional[tuple[SimulationConditions, ...]]] = {
         SimulationConditions(ProcessCorner.TT, 27.0, 1.8),   # nominal
         SimulationConditions(ProcessCorner.FF, 125.0, 1.71),  # sec 22's worst-case corner, now 27/27-confirmed
     ),
+    "minimal27": pvt_sweep.MINIMAL_27_CONDITIONS,
 }
 
 
@@ -235,7 +270,6 @@ def select_final_design(
             "selection_basis": "nominal-only (no PVT conditions supplied)",
         }
 
-    from simulator.receiver import EvaluationFidelity
     fidelity = pvt_fidelity or EvaluationFidelity.FINAL
     pvt_results: list[PVTRobustnessResult] = [
         run_pvt_evaluation(d, pvt_conditions, fidelity=fidelity) for d in designs
@@ -295,6 +329,40 @@ def _pvt_result_from_selection(selection: dict[str, Any]) -> Optional[PVTRobustn
 
 
 # ---------------------------------------------------------------------------
+# Optional stage: HD3/input-referred-noise refinement (final audit gaps A/B)
+#
+# simulator/receiver.py already implements both measurements for real
+# (_run_hd3: 100 mVpp differential at 100 MHz, three amplitudes at FINAL
+# fidelity; _run_noise: 10 MHz-5 GHz integrated input-referred noise) --
+# they are not missing infrastructure. They only run at
+# fidelity >= EvaluationFidelity.CANDIDATE, but generate_candidates() uses
+# TRAINING fidelity throughout (the cheaper level PPO's rollout needs), so
+# a freshly-generated candidate's own metrics never include them. This
+# stage runs ONE additional real-SPICE evaluation, at FINAL fidelity and
+# nominal conditions, of the ALREADY-SELECTED design only -- never during
+# search/optimization, never for rejected candidates -- to obtain the
+# genuine values for the final specification report. Off by default (an
+# explicit opt-in, since it is one more real-SPICE evaluation on top of
+# whatever candidate generation already spent).
+# ---------------------------------------------------------------------------
+
+def measure_hd3_and_noise(
+    parameters: dict[str, float], *, conditions: SimulationConditions = SimulationConditions(),
+) -> dict[str, Any]:
+    """Runs the existing, unmodified evaluate_receiver at FINAL fidelity for
+    one design at nominal conditions -- the only fidelity level at which
+    HD3 and input-referred noise are measured. Returns
+    {"success", "metrics", "failed_stage"}; never fabricates a value --
+    if this evaluation itself fails (a stricter FINAL-fidelity gate can
+    reject a design that passed at TRAINING fidelity), the caller keeps
+    reporting NOT CLAIMED for HD3/noise rather than inventing a number.
+    """
+
+    evaluation = evaluate_receiver(ReceiverParameters(**parameters), conditions, EvaluationFidelity.FINAL)
+    return {"success": evaluation.success, "metrics": dict(evaluation.metrics), "failed_stage": evaluation.failed_stage}
+
+
+# ---------------------------------------------------------------------------
 # Full pipeline
 # ---------------------------------------------------------------------------
 
@@ -311,6 +379,7 @@ def run_pipeline(
     initial_indices_source: str = "verified",
     pvt_conditions: Optional[tuple] = None,
     trade_off_preference: str = "most_robust",
+    measure_hd3_noise_flag: bool = False,
     export_schematic_to: Optional[Path] = None,
 ) -> dict[str, Any]:
     problems = validate_target(target)
@@ -336,8 +405,24 @@ def run_pipeline(
         "selection": selection,
     }
 
+    if selection["selected"] is not None and measure_hd3_noise_flag and backend == "real":
+        refinement = measure_hd3_and_noise(selection["selected"]["parameters"])
+        result["hd3_noise_refinement"] = {
+            "attempted": True, "success": refinement["success"], "failed_stage": refinement["failed_stage"],
+        }
+        if refinement["success"]:
+            # Merge -- keep the original TRAINING-fidelity metrics and add/
+            # override with the richer FINAL-fidelity set (which includes
+            # hd3_db/input_referred_noise_vrms, absent before this point).
+            selection["selected"]["metrics"] = {**selection["selected"]["metrics"], **refinement["metrics"]}
+    elif measure_hd3_noise_flag and backend != "real":
+        result["hd3_noise_refinement"] = {
+            "attempted": False, "success": None, "failed_stage": None,
+            "note": "measure_hd3_noise_flag has no effect for backend='synthetic' -- "
+                    "HD3/noise are real-ngspice-only measurements.",
+        }
+
     if selection["selected"] is not None and export_schematic_to is not None:
-        from simulator.receiver import ReceiverParameters
         parameters = ReceiverParameters(**selection["selected"]["parameters"])
         schematic_text = render_final_schematic(
             parameters, achieved_metrics=selection["selected"]["metrics"],
@@ -349,11 +434,14 @@ def run_pipeline(
         result["schematic_path"] = str(export_schematic_to)
 
     if selection["selected"] is not None:
+        source_note = f"pipeline run, backend={backend}, checkpoint={checkpoint_path}"
+        if result.get("hd3_noise_refinement", {}).get("success"):
+            source_note += " + FINAL-fidelity HD3/noise refinement (measure_hd3_and_noise)"
         report = build_final_specification_report(
             design_id=selection["selected"]["design_id"],
             parameters=selection["selected"]["parameters"],
             nominal_metrics=selection["selected"]["metrics"],
-            nominal_source=f"pipeline run, backend={backend}, checkpoint={checkpoint_path}",
+            nominal_source=source_note,
             pvt_result=_pvt_result_from_selection(selection),
         )
         result["final_specification"] = report
@@ -381,13 +469,26 @@ def _main() -> int:
     parser.add_argument("--randomize-initial-state", action="store_true", default=True)
     parser.add_argument("--initial-indices-source", choices=("verified", "grid-center"), default="verified")
     parser.add_argument("--pvt-condition-set", choices=tuple(PVT_CONDITION_SETS), default="none",
-                         help="'none' (default, unchanged behavior): nominal-only selection, no PVT SPICE spent. "
-                              "'smoke': 2 conditions (nominal TT + one stress corner) -- enough to exercise the "
-                              "PVT-aware selection pathway with real SPICE without re-running the full 27-point "
-                              "robustness sweep (see experiments/pvt_sweep.py for that).")
+                         help="'none' (default, unchanged behavior): NOMINAL-ONLY selection -- the selected design "
+                              "is NOT validated across process/voltage/temperature, only at nominal TT/1.8V/27C; "
+                              "do not read a 'none' run as PVT-robust. 'smoke': 2 conditions (nominal TT + one "
+                              "stress corner) -- exercises the PVT-aware selection pathway with real SPICE, still "
+                              "NOT a robustness proof. 'minimal27': the full 27-point TT/SS/FF x VDD+/-5% x "
+                              "0-125C robustness sweep (experiments/pvt_sweep.py's own MINIMAL_27_CONDITIONS) -- "
+                              "the only choice that constitutes an actual PVT robustness result; SLOW "
+                              "(~121.8 min historically for one design, docs/autockt-mapping.md sec 22) and never "
+                              "selected automatically.")
     parser.add_argument("--trade-off-preference", choices=("most_robust", "lowest_power", "strongest_eye_height",
                                                              "widest_eye", "largest_margin", "balanced"),
                          default="most_robust")
+    parser.add_argument(
+        "--measure-hd3-noise", action="store_true", default=False,
+        help="After selection, run ONE additional real-SPICE evaluation (FINAL fidelity, nominal conditions) of "
+             "the selected design to measure HD3 (100 mVpp differential) and 10 MHz-5 GHz input-referred noise -- "
+             "both otherwise NOT CLAIMED, since candidate generation runs at the cheaper TRAINING fidelity that "
+             "never reaches those stages (simulator/receiver.py::_run_hd3/_run_noise). No effect for "
+             "--backend synthetic. Off by default (adds real SPICE time).",
+    )
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--export-schematic", type=Path, default=None)
     args = parser.parse_args()
@@ -411,6 +512,7 @@ def _main() -> int:
         initial_indices_source=args.initial_indices_source,
         pvt_conditions=PVT_CONDITION_SETS[args.pvt_condition_set],
         trade_off_preference=args.trade_off_preference,
+        measure_hd3_noise_flag=args.measure_hd3_noise,
         export_schematic_to=args.export_schematic,
     )
     args.output.parent.mkdir(parents=True, exist_ok=True)

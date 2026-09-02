@@ -16,7 +16,10 @@
       "Bash(pwd)",
       "Bash(sleep *)",
       "Bash(KMP_DUPLICATE_LIB_OK=TRUE conda run -n nebula python -m tests.run_fast_suite)",
-      "Bash(KMP_DUPLICATE_LIB_OK=TRUE conda run -n nebula python -m unittest tests.run_fast_suite)"
+      "Bash(KMP_DUPLICATE_LIB_OK=TRUE conda run -n nebula python -m unittest tests.run_fast_suite)",
+      "Bash(KMP_DUPLICATE_LIB_OK=TRUE conda run -n nebula python -c ' *)",
+      "Bash(PYTHONFAULTHANDLER=1 KMP_DUPLICATE_LIB_OK=TRUE conda run -n nebula python -c ' *)",
+      "Bash(git check-ignore *)"
     ]
   }
 }

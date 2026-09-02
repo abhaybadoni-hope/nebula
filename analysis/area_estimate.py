@@ -90,6 +90,16 @@ class AreaEstimate:
         "transistor_channel_area_um2/mm2 is the channel area ONLY -- do "
         "NOT compare it directly against the 0.05 mm^2 official budget; "
         "see missing_components for what is not included.",
+        "what a defensible total-area estimate would require: (1) SKY130 "
+        "PDK per-unit resistor (ohm/square) and capacitor (fF/um^2) "
+        "layout data for the specific device flavors this design would "
+        "use -- not sourced here, since the locally cached PDK is outside "
+        "this project's own access boundary and no such figures are "
+        "otherwise recorded in this repository; (2) a stated layout-"
+        "overhead/margin factor for the transistors (diffusion, contacts, "
+        "guard rings, routing) -- none is defined anywhere in this "
+        "project. Absent both, any total-area number would be invented, "
+        "not measured -- so none is reported.",
     ))
 
 
