@@ -1,0 +1,40 @@
+* Experimental transistor-level sampler and resistive one-tap feedback.
+* External clock source/driver is not included. Requires real-SPICE validation.
+.subckt NEBULA_INV a y vdd vss
+XP y a vdd vdd sky130_fd_pr__pfet_01v8 W=2 L=0.15
+XN y a vss vss sky130_fd_pr__nfet_01v8 W=1 L=0.15
+.ends NEBULA_INV
+.subckt NEBULA_TG a b en enb vdd vss
+XN a en b vss sky130_fd_pr__nfet_01v8 W=2 L=0.15
+XP a enb b vdd sky130_fd_pr__pfet_01v8 W=4 L=0.15
+.ends NEBULA_TG
+* Two static transmission-gate latches form a rising-edge flip-flop.
+.subckt NEBULA_DFF d clk q qb vdd vss
+XCLK clk clkb vdd vss NEBULA_INV
+XTMI d m clkb clk vdd vss NEBULA_TG
+XMI m mb vdd vss NEBULA_INV
+XMII mb mi vdd vss NEBULA_INV
+XTMF mi m clk clkb vdd vss NEBULA_TG
+XTSI mi s clk clkb vdd vss NEBULA_TG
+XSI s qb vdd vss NEBULA_INV
+XSII qb q vdd vss NEBULA_INV
+XTSF q s clkb clk vdd vss NEBULA_TG
+.ends NEBULA_DFF
+.subckt NEBULA_SAMPLER_DFE inp inn clk q qb sump sumn fpos fneg vdd vss
++ params: RIN=1000 RFB=180000 RCMP=20000 RBREF=10000
+* inp is the logical-positive CTLE output. Previous decision is held by DFF.
+RIP inp sump {RIN}
+RINN inn sumn {RIN}
+RFP fpos sump {RFB}
+RFN fneg sumn {RFB}
+RCP vdd cp {RCMP}
+RCN vdd cn {RCMP}
+XCP cn sump tail vss sky130_fd_pr__nfet_01v8 W=5 L=0.15
+XCN cp sumn tail vss sky130_fd_pr__nfet_01v8 W=5 L=0.15
+RB vdd bias {RBREF}
+XREF bias bias vss vss sky130_fd_pr__nfet_01v8 W=10 L=0.5
+XTAIL tail bias vss vss sky130_fd_pr__nfet_01v8 W=10 L=0.5
+XBUF1 cp db vdd vss NEBULA_INV
+XBUF2 db d vdd vss NEBULA_INV
+XD d clk q qb vdd vss NEBULA_DFF
+.ends NEBULA_SAMPLER_DFE

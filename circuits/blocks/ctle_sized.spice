@@ -5,8 +5,8 @@
 RDP vdd outp {RLOAD}
 RDN vdd outn {RLOAD}
 
-XMP outp inp srcp vss sky130_fd_pr__nfet_01v8 W=10 L=0.15
-XMN outn inn srcn vss sky130_fd_pr__nfet_01v8 W=10 L=0.15
+XMP outp inp srcp vss sky130_fd_pr__nfet_01v8 W={WIN} L={LIN}
+XMN outn inn srcn vss sky130_fd_pr__nfet_01v8 W={WIN} L={LIN}
 
 RS1 srcp tail {RDEG}
 RS2 srcn tail {RDEG}

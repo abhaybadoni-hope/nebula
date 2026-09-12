@@ -82,10 +82,10 @@ class BuildReportTests(unittest.TestCase):
         by_metric = {row["metric"]: row for row in report["rows"]}
         pvt_row = by_metric["PVT (pass/total)"]
         self.assertEqual(pvt_row["measured"], "1/2")
-        self.assertEqual(pvt_row["verdict"], "PARTIAL")
+        self.assertEqual(pvt_row["verdict"], "FAIL")
         self.assertIn("ff", pvt_row["source"])
 
-    def test_pvt_row_is_pass_at_full_pass_rate(self):
+    def test_pvt_smoke_pass_rate_does_not_claim_full_coverage(self):
         pvt = summarize_pvt_results("design_a", [
             PVTPointResult("tt", 1.8, 27.0, True, None),
             PVTPointResult("ff", 1.71, 125.0, True, None),
@@ -96,7 +96,7 @@ class BuildReportTests(unittest.TestCase):
             pvt_result=pvt,
         )
         by_metric = {row["metric"]: row for row in report["rows"]}
-        self.assertEqual(by_metric["PVT (pass/total)"]["verdict"], "PASS")
+        self.assertEqual(by_metric["PVT (pass/total)"]["verdict"], "NOT CLAIMED")
 
     def test_no_pvt_result_is_not_claimed(self):
         report = build_final_specification_report(

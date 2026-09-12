@@ -73,7 +73,7 @@ BACKENDS = ("synthetic", "real")
 # the pipeline's own PVT_CONDITION_SETS keys by
 # tests/test_web_ui.py::PvtOptionsMatchPipelineTests so the two cannot
 # silently drift apart.
-PVT_CONDITION_SETS = ("none", "smoke", "minimal27")
+PVT_CONDITION_SETS = ("none", "smoke", "minimal27", "full60")
 TRADE_OFF_PREFERENCES = (
     "most_robust", "lowest_power", "strongest_eye_height", "widest_eye", "largest_margin", "balanced",
 )
@@ -91,6 +91,10 @@ _RUN_ID_RE = re.compile(r"^[0-9a-f]{32}$")
 
 def _validate_request(payload: dict[str, Any]) -> list[str]:
     problems: list[str] = []
+    for name, default, upper in (("search_seconds", 120, 600), ("max_evaluations", 4, 100)):
+        value = payload.get(name, default)
+        if not isinstance(value, (int, float)) or not 1 <= value <= upper or (name == "max_evaluations" and int(value) != value):
+            problems.append(f"{name} must be between 1 and {upper}")
     if payload.get("target_mode") not in TARGET_MODES:
         problems.append(f"target_mode must be one of {TARGET_MODES}")
     if payload.get("target_mode") == "custom":
@@ -132,6 +136,8 @@ def _build_argv(payload: dict[str, Any], *, output_path: Path, schematic_path: P
     argv = [
         sys.executable, "-m", "experiments.run_autockt_pipeline",
         "--backend", payload["backend"],
+        "--search-seconds", str(payload.get("search_seconds", 120)),
+        "--max-evaluations", str(int(payload.get("max_evaluations", 4))),
         "--episodes", str(int(payload["episodes"])),
         "--horizon", str(int(payload["horizon"])),
         "--initial-indices-source", payload.get("initial_indices_source", "verified"),
@@ -467,14 +473,20 @@ INDEX_HTML = r"""<!doctype html>
 
     <fieldset>
       <legend>PVT-aware selection</legend>
+      <label for="searchSeconds">Search time budget</label>
+      <select id="searchSeconds"><option value="120">Fast — 2 minutes</option><option value="300">5 minutes</option><option value="600">10 minutes</option></select>
+      <label for="maxEvaluations">Maximum search evaluations</label>
+      <input id="maxEvaluations" type="number" min="1" max="100" value="4">
+      <p class="hint">Cached evaluations are reused. Full PVT and final characterization are separate from this search budget and can take longer.</p>
       <label for="pvtSet">Condition set</label>
       <select id="pvtSet">
         <option value="none">None -- NOMINAL-ONLY (not PVT-robust; only TT/1.8V/27C is checked)</option>
         <option value="smoke">Smoke -- 2 conditions (nominal + 1 stress corner; not a robustness proof)</option>
-        <option value="minimal27">Full 27-point sweep -- TT/SS/FF x VDD+/-5% x 0-125C (SLOW, ~2h/design)</option>
+        <option value="minimal27">Partial 27-point sweep -- TT/SS/FF x VDD+/-5% x 0-125C (SLOW, ~2h/design)</option>
+        <option value="full60">Full 60-point grid -- TT/SS/FF/SF/FS x 3 supplies x 4 temperatures (SLOW)</option>
       </select>
-      <p class="hint">"None" and "smoke" do NOT establish PVT robustness -- only "Full 27-point sweep" does
-        (see docs/autockt-mapping.md sec 22's 27/27 result). The manual real-SPICE demo run used "None".</p>
+      <p class="hint">Nominal, smoke and 27-point sweeps do NOT establish PVT robustness across the required grid.
+        The 27-point sweep omits SF and FS. Full coverage requires all 60 conditions to pass.</p>
       <label for="tradeOff">Trade-off preference (used on PVT ties)</label>
       <select id="tradeOff">
         <option value="most_robust">Most robust</option>
@@ -484,7 +496,7 @@ INDEX_HTML = r"""<!doctype html>
         <option value="largest_margin">Largest margin</option>
         <option value="balanced">Balanced</option>
       </select>
-      <p class="hint">"smoke" spends real SPICE only on nominally-feasible candidates -- not the full 27-point robustness sweep.</p>
+      <p class="hint">"smoke" spends real SPICE only on nominally-feasible candidates -- not the full required 60-condition grid.</p>
     </fieldset>
 
     <button id="runBtn">Run NEBULA</button>
@@ -560,6 +572,8 @@ function buildPayload() {
     episodes: parseInt($('episodes').value, 10),
     horizon: parseInt($('horizon').value, 10),
     initial_indices_source: $('initSource').value,
+    search_seconds: Number($('searchSeconds').value),
+    max_evaluations: Number($('maxEvaluations').value),
     pvt_condition_set: $('pvtSet').value,
     trade_off_preference: $('tradeOff').value,
     measure_hd3_noise: $('measureHd3Noise').checked,
@@ -601,7 +615,7 @@ function renderResult(payload) {
       paramGrid.appendChild(div);
     }
   } else {
-    paramGrid.innerHTML = '<div class="k">No feasible design was selected by this run.</div>';
+    paramGrid.textContent = result.selection.reason || "No feasible design was selected by this run.";
   }
 
   const specRows = $('specRows');
@@ -609,7 +623,7 @@ function renderResult(payload) {
   const rows = (result.final_specification && result.final_specification.rows) || [];
   for (const row of rows) {
     const tr = document.createElement('tr');
-    tr.innerHTML = `<td>${row.metric}</td><td>${row.measured ?? 'n/a'}</td><td>${row.requirement}</td>` +
+    tr.innerHTML = `<td>${row.metric}</td><td>${row.measured ?? 'n/a'}</td><td>${row.requirement}<br><small>${row.source || ''}</small></td>` +
                     `<td><span class="${verdictClass(row.verdict)}">${row.verdict}</span></td>`;
     specRows.appendChild(tr);
   }
@@ -626,6 +640,7 @@ function renderResult(payload) {
   }
 
   $('runSummary').innerHTML =
+    `<div><div class="k">Search evaluations / cache hits</div><div class="v">${result.runtime?.evaluation_calls ?? "n/a"} / ${result.runtime?.cache_hits ?? "n/a"}</div></div>` +
     `<div><div class="k">Candidates generated</div><div class="v">${result.n_candidates_generated}</div></div>` +
     `<div><div class="k">Nominally feasible</div><div class="v">${result.n_nominally_feasible}</div></div>` +
     `<div><div class="k">Backend</div><div class="v">${result.backend}</div></div>` +

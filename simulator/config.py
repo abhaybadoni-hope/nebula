@@ -6,6 +6,7 @@ from dataclasses import asdict, dataclass
 from enum import Enum
 import os
 from pathlib import Path
+from .sizing import CircuitSizing
 
 
 SKY130_MODEL_ENV = "SKY130_MODEL_LIBRARY"
@@ -29,8 +30,32 @@ class SimulationConditions:
     source_resistance_per_leg_ohm: float = 50.0
     receiver_termination_diff_ohm: float = 100.0
     input_parasitic_f: float = 0.0
+    circuit_sizing: CircuitSizing | None = None
+    stimulus_pattern: str = "prbs7"
+    stimulus_jitter_rms_s: float = 0.0
+    stimulus_pwl_tolerance_v: float = 0.0
+    training_bit_count: int = 128
+    validation_bit_count: int | None = None
+
+    def __post_init__(self):
+        if isinstance(self.process_corner, str) and self.process_corner in {c.value for c in ProcessCorner}:
+            object.__setattr__(self, "process_corner", ProcessCorner(self.process_corner))
+        if isinstance(self.circuit_sizing, dict):
+            object.__setattr__(self, "circuit_sizing", CircuitSizing(**self.circuit_sizing))
 
     def validate(self) -> None:
+        if not 0 <= self.stimulus_pwl_tolerance_v <= 1e-5:
+            raise ValueError("PWL differential waveform tolerance must be 0..10 microvolts")
+        if type(self.training_bit_count) is not int or not 64 <= self.training_bit_count <= 128:
+            raise ValueError("training bit count must be an integer between 64 and 128")
+        if self.stimulus_pattern not in ("prbs7", "prbs15", "1010", "long_runs", "regression", "isolated_one"):
+            raise ValueError("unsupported stimulus pattern")
+        if not 0 <= self.stimulus_jitter_rms_s <= 10e-12:
+            raise ValueError("jitter must be between zero and 10 ps RMS")
+        if self.validation_bit_count is not None and not 128 <= self.validation_bit_count <= 65536:
+            raise ValueError("validation bit count must be between 128 and 65536")
+        if self.circuit_sizing is not None:
+            self.circuit_sizing.validate()
         if not isinstance(self.process_corner, ProcessCorner):
             raise ValueError("process corner must be a ProcessCorner value")
         if not 0 <= self.temperature_c <= 125:
@@ -66,7 +91,12 @@ class Sky130Config:
         candidates: list[Path] = []
         requested = self.model_library or os.environ.get(SKY130_MODEL_ENV)
         if requested:
-            candidates.append(Path(requested).expanduser())
+            requested_path = Path(requested).expanduser()
+            if not requested_path.is_file():
+                raise FileNotFoundError(f"SKY130 model library does not exist: {requested_path}")
+            return requested_path.resolve()
+        local_model = Path(__file__).resolve().parents[1] / "generated/sky130-flat.lib.spice"
+        candidates.append(local_model)
         home = Path.home()
         pdk_root = os.environ.get("PDK_ROOT")
         if pdk_root:

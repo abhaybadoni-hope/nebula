@@ -55,7 +55,9 @@ from typing import Any, Optional
 
 import torch
 
-from simulator.config import ProcessCorner, SimulationConditions
+from simulator.config import ProcessCorner, SimulationConditions, PVT_GRID
+from analysis.acceptance import acceptance_violations
+from simulator.runtime import SearchLimits, BudgetedEvaluator
 from simulator.receiver import EvaluationFidelity, ReceiverParameters, evaluate_receiver
 from simulator.rl_adapter import ReceiverRLAdapter, RLBudget
 
@@ -81,18 +83,8 @@ from analysis.pvt_selection import (
 
 
 # ---------------------------------------------------------------------------
-# CLI-only: named PVT condition sets (mirrors experiments/pvt_sweep.py's
-# --condition-set pattern). "smoke" is intentionally the smallest set that
-# still exercises the PVT-aware SELECTION LOGIC (pass-rate ranking, tie-break,
-# trade-off preference) with more than one real condition. "minimal27"
-# reuses experiments/pvt_sweep.py's own MINIMAL_27_CONDITIONS (the SAME
-# 27-point set behind docs/autockt-mapping.md sec 22's 27/27 result) --
-# it is exposed here as an explicit, opt-in choice so full PVT robustness
-# checking is reachable from this pipeline/UI, but "none" stays the
-# default and nothing here ever selects or runs it automatically. At
-# ~121.8 min historically for one design (sec 22), it is exponentially
-# more expensive per nominally-feasible candidate than "smoke" and should
-# be chosen deliberately, not by default.
+# Explicit PVT options. Only full60 covers the required five process corners.
+# Nominal-only remains the default; validation expense is opt-in.
 # ---------------------------------------------------------------------------
 
 PVT_CONDITION_SETS: dict[str, Optional[tuple[SimulationConditions, ...]]] = {
@@ -102,6 +94,7 @@ PVT_CONDITION_SETS: dict[str, Optional[tuple[SimulationConditions, ...]]] = {
         SimulationConditions(ProcessCorner.FF, 125.0, 1.71),  # sec 22's worst-case corner, now 27/27-confirmed
     ),
     "minimal27": pvt_sweep.MINIMAL_27_CONDITIONS,
+    "full60": PVT_GRID,
 }
 
 
@@ -138,6 +131,7 @@ class PipelineCandidate:
     reward: float
     spec_satisfied: bool
     steps: int
+    simulation_success: bool = True
 
 
 def generate_candidates(
@@ -154,6 +148,8 @@ def generate_candidates(
     initial_indices_source: str = "verified",
     randomize_initial_state: bool = True,
     max_evaluations: int = 1000,
+    search_limits: SearchLimits | None = None,
+    runtime_stats: Optional[dict] = None,
 ) -> list[PipelineCandidate]:
     """Deterministic rollout of an existing policy against `target`, via the
     real, UNMODIFIED AutoCktReceiverEnv + PPOAgent + ReceiverRLAdapter.
@@ -169,7 +165,10 @@ def generate_candidates(
     grids = build_parameter_grids(grid_points, spacing=grid_spacing)
     initial_indices = _resolve_initial_indices(grids, initial_indices_source)
 
+    bounded = BudgetedEvaluator(search_limits) if backend == "real" and search_limits else None
     adapter_kwargs: dict[str, Any] = {}
+    if bounded:
+        adapter_kwargs["evaluator"] = bounded
     if backend == "synthetic":
         adapter_kwargs["evaluator"] = synthetic_evaluate_receiver
     adapter = ReceiverRLAdapter(budget=RLBudget(max_evaluations), seed=eval_seed, **adapter_kwargs)
@@ -184,6 +183,8 @@ def generate_candidates(
 
     candidates: list[PipelineCandidate] = []
     for episode in range(episodes):
+        if bounded and not bounded.available():
+            break
         state, _ = env.reset()
         done = truncated = False
         episode_reward = 0.0
@@ -191,6 +192,8 @@ def generate_candidates(
         last_parameters: Optional[dict[str, float]] = None
         last_metrics: Optional[dict[str, float]] = None
         while not done and not truncated:
+            if bounded and not bounded.available():
+                break
             choices, _log_prob, _value = agent.act(state, deterministic=True)
             step_out = env.step(choices)
             episode_reward += step_out.reward
@@ -199,10 +202,18 @@ def generate_candidates(
             steps += 1
             last_parameters = step_out.info["parameters"]
             last_metrics = step_out.info["metrics"]
+            if backend == "synthetic":
+                # The synthetic backend models only the four target metrics.
+                last_metrics = {k: v for k, v in last_metrics.items() if k in SPEC_NAMES}
+        if last_parameters is None:
+            break
         candidates.append(PipelineCandidate(
             episode=episode, parameters=last_parameters or {}, metrics=last_metrics or {},
             reward=episode_reward, spec_satisfied=done, steps=steps,
+            simulation_success=bool(step_out.info["success"]),
         ))
+    if runtime_stats is not None and bounded:
+        runtime_stats.update(bounded.summary())
     return candidates
 
 
@@ -210,13 +221,10 @@ def generate_candidates(
 # Stage 4: nominal feasibility filter
 # ---------------------------------------------------------------------------
 
-def filter_nominal_feasible(candidates: list[PipelineCandidate]) -> list[PipelineCandidate]:
-    """`spec_satisfied` was already computed inside AutoCktReceiverEnv.step()
-    via the existing, unmodified autockt_reward -- this filters on that
-    result directly rather than recomputing the check.
-    """
-
-    return [c for c in candidates if c.spec_satisfied]
+def filter_nominal_feasible(candidates: list[PipelineCandidate], target: TargetSpec | None = None, *, require_peaking: bool = True) -> list[PipelineCandidate]:
+    """Accept measured constraints, independently of the reward's terminal bonus."""
+    target = target or TargetSpec.from_existing_thresholds()
+    return [c for c in candidates if c.simulation_success and not acceptance_violations(c.metrics, target, require_peaking=require_peaking)]
 
 
 # ---------------------------------------------------------------------------
@@ -240,6 +248,7 @@ def select_final_design(
     pvt_conditions: Optional[tuple] = None,
     pvt_fidelity=None,
     minimum_pass_rate: float = 1.0,
+    pvt_cache: Optional[dict] = None,
     trade_off_preference: str = "most_robust",
 ) -> dict[str, Any]:
     """Priority, deterministic and documented (not an arbitrary weighted
@@ -271,11 +280,19 @@ def select_final_design(
         }
 
     fidelity = pvt_fidelity or EvaluationFidelity.FINAL
-    pvt_results: list[PVTRobustnessResult] = [
-        run_pvt_evaluation(d, pvt_conditions, fidelity=fidelity) for d in designs
-    ]
+    cache = pvt_cache if pvt_cache is not None else {}
+    pvt_results = []
+    for design in designs:
+        key = (design.design_id, tuple(sorted(design.parameters.items())), tuple(pvt_conditions), fidelity)
+        if key not in cache:
+            cache[key] = run_pvt_evaluation(design, pvt_conditions, fidelity=fidelity)
+        # IDs are stable within a pipeline run.
+        pvt_results.append(cache[key])
+    eligible = [r for r in pvt_results if r.n_conditions and r.pass_rate >= minimum_pass_rate]
+    if not eligible:
+        return {"selected": None, "pvt": None, "reason": "no candidate passed the requested PVT conditions"}
     top = select_with_trade_off_preference(
-        pvt_results, designs, preference=trade_off_preference, minimum_pass_rate=minimum_pass_rate,
+        eligible, designs, preference=trade_off_preference, minimum_pass_rate=minimum_pass_rate,
     )
     matching_design = next(d for d in designs if d.design_id == top.design_id)
     return {
@@ -286,6 +303,7 @@ def select_final_design(
         "pvt": {
             "n_conditions": top.n_conditions, "n_passing": top.n_passing, "pass_rate": top.pass_rate,
             "met_minimum_pass_rate": top.pass_rate >= minimum_pass_rate,
+            "points": [asdict(p) for p in top.points],
             "worst_case_conditions": [
                 {"corner": p.process_corner, "vdd": p.supply_v, "temp_c": p.temperature_c,
                  "failed_stage": p.failed_stage}
@@ -300,16 +318,7 @@ def select_final_design(
 
 
 def _pvt_result_from_selection(selection: dict[str, Any]) -> Optional[PVTRobustnessResult]:
-    """Reconstructs the PVTRobustnessResult select_final_design already
-    computed (real SPICE, if pvt_conditions was given) from its
-    JSON-serializable `selection["pvt"]` summary, so run_pipeline can feed
-    the SAME result into build_final_specification_report instead of
-    dropping it (or, worse, re-running PVT a second time to get an object
-    back). Only `worst_case_conditions`/summary fields are reconstructed --
-    `points` (the full per-condition list) is not part of the summary dict
-    and is not needed by build_final_specification_report/format_report,
-    which only read the summary fields.
-    """
+    """Restore the measured per-condition evidence without rerunning SPICE."""
 
     pvt = selection.get("pvt")
     if pvt is None:
@@ -324,38 +333,23 @@ def _pvt_result_from_selection(selection: dict[str, Any]) -> Optional[PVTRobustn
             )
             for w in pvt["worst_case_conditions"]
         ),
-        points=(),
+        points=tuple(PVTPointResult(**p) for p in pvt.get("points", [])),
     )
 
 
 # ---------------------------------------------------------------------------
-# Optional stage: HD3/input-referred-noise refinement (final audit gaps A/B)
-#
-# simulator/receiver.py already implements both measurements for real
-# (_run_hd3: 100 mVpp differential at 100 MHz, three amplitudes at FINAL
-# fidelity; _run_noise: 10 MHz-5 GHz integrated input-referred noise) --
-# they are not missing infrastructure. They only run at
-# fidelity >= EvaluationFidelity.CANDIDATE, but generate_candidates() uses
-# TRAINING fidelity throughout (the cheaper level PPO's rollout needs), so
-# a freshly-generated candidate's own metrics never include them. This
-# stage runs ONE additional real-SPICE evaluation, at FINAL fidelity and
-# nominal conditions, of the ALREADY-SELECTED design only -- never during
-# search/optimization, never for rejected candidates -- to obtain the
-# genuine values for the final specification report. Off by default (an
-# explicit opt-in, since it is one more real-SPICE evaluation on top of
-# whatever candidate generation already spent).
+# Optional FINAL-fidelity validation. Reject failed candidates, retain their
+# measurements for diagnosis, and try the remaining candidates in rank order.
 # ---------------------------------------------------------------------------
 
 def measure_hd3_and_noise(
     parameters: dict[str, float], *, conditions: SimulationConditions = SimulationConditions(),
 ) -> dict[str, Any]:
     """Runs the existing, unmodified evaluate_receiver at FINAL fidelity for
-    one design at nominal conditions -- the only fidelity level at which
-    HD3 and input-referred noise are measured. Returns
+    one design at nominal conditions -- including HD3 and input-referred noise. Returns
     {"success", "metrics", "failed_stage"}; never fabricates a value --
     if this evaluation itself fails (a stricter FINAL-fidelity gate can
-    reject a design that passed at TRAINING fidelity), the caller keeps
-    reporting NOT CLAIMED for HD3/noise rather than inventing a number.
+    reject a design that passed at TRAINING fidelity), the caller rejects this candidate and tries another.
     """
 
     evaluation = evaluate_receiver(ReceiverParameters(**parameters), conditions, EvaluationFidelity.FINAL)
@@ -381,23 +375,28 @@ def run_pipeline(
     trade_off_preference: str = "most_robust",
     measure_hd3_noise_flag: bool = False,
     export_schematic_to: Optional[Path] = None,
+    search_limits: SearchLimits | None = None,
 ) -> dict[str, Any]:
     problems = validate_target(target)
     if problems:
         raise ValueError(f"invalid target specification: {problems}")
 
+    runtime_stats = {}
     candidates = generate_candidates(
         target=target, checkpoint_path=checkpoint_path, agent_seed=agent_seed, eval_seed=eval_seed,
         episodes=episodes, horizon=horizon, backend=backend, randomize_initial_state=randomize_initial_state,
         initial_indices_source=initial_indices_source,
+        search_limits=search_limits, runtime_stats=runtime_stats,
     )
-    feasible = filter_nominal_feasible(candidates)
+    feasible = filter_nominal_feasible(candidates, target, require_peaking=backend == "real")
+    pvt_cache = {}
     selection = select_final_design(
-        feasible, pvt_conditions=pvt_conditions, trade_off_preference=trade_off_preference,
+        feasible, pvt_cache=pvt_cache, pvt_conditions=pvt_conditions, trade_off_preference=trade_off_preference,
     )
 
     result: dict[str, Any] = {
         "target": target.as_dict(),
+        "runtime": runtime_stats,
         "backend": backend,
         "checkpoint_path": str(checkpoint_path) if checkpoint_path else None,
         "n_candidates_generated": len(candidates),
@@ -406,15 +405,29 @@ def run_pipeline(
     }
 
     if selection["selected"] is not None and measure_hd3_noise_flag and backend == "real":
-        refinement = measure_hd3_and_noise(selection["selected"]["parameters"])
+        attempts = []
+        remaining = list(feasible)
+        while selection["selected"] is not None:
+            selected = selection["selected"]
+            refinement = measure_hd3_and_noise(selected["parameters"])
+            violations = acceptance_violations(refinement["metrics"], target, final=True)
+            accepted = refinement["success"] and not violations
+            attempts.append({"design_id": selected["design_id"], "success": accepted,
+                             "failed_stage": refinement["failed_stage"], "violations": violations,
+                             "metrics": refinement["metrics"]})
+            if accepted:
+                selected["metrics"] = dict(refinement["metrics"])
+                break
+            remaining = [c for c in remaining if c.parameters != selected["parameters"]]
+            selection = select_final_design(
+                remaining, pvt_conditions=pvt_conditions, trade_off_preference=trade_off_preference, pvt_cache=pvt_cache)
+        if selection["selected"] is None:
+            selection["reason"] = "no candidate passed final validation"
+        result["selection"] = selection
         result["hd3_noise_refinement"] = {
-            "attempted": True, "success": refinement["success"], "failed_stage": refinement["failed_stage"],
+            "attempted": True, "success": selection["selected"] is not None,
+            "failed_stage": attempts[-1]["failed_stage"], "attempts": attempts,
         }
-        if refinement["success"]:
-            # Merge -- keep the original TRAINING-fidelity metrics and add/
-            # override with the richer FINAL-fidelity set (which includes
-            # hd3_db/input_referred_noise_vrms, absent before this point).
-            selection["selected"]["metrics"] = {**selection["selected"]["metrics"], **refinement["metrics"]}
     elif measure_hd3_noise_flag and backend != "real":
         result["hd3_noise_refinement"] = {
             "attempted": False, "success": None, "failed_stage": None,
@@ -469,15 +482,9 @@ def _main() -> int:
     parser.add_argument("--randomize-initial-state", action="store_true", default=True)
     parser.add_argument("--initial-indices-source", choices=("verified", "grid-center"), default="verified")
     parser.add_argument("--pvt-condition-set", choices=tuple(PVT_CONDITION_SETS), default="none",
-                         help="'none' (default, unchanged behavior): NOMINAL-ONLY selection -- the selected design "
-                              "is NOT validated across process/voltage/temperature, only at nominal TT/1.8V/27C; "
-                              "do not read a 'none' run as PVT-robust. 'smoke': 2 conditions (nominal TT + one "
-                              "stress corner) -- exercises the PVT-aware selection pathway with real SPICE, still "
-                              "NOT a robustness proof. 'minimal27': the full 27-point TT/SS/FF x VDD+/-5% x "
-                              "0-125C robustness sweep (experiments/pvt_sweep.py's own MINIMAL_27_CONDITIONS) -- "
-                              "the only choice that constitutes an actual PVT robustness result; SLOW "
-                              "(~121.8 min historically for one design, docs/autockt-mapping.md sec 22) and never "
-                              "selected automatically.")
+                         help="none: nominal only (default). smoke: two conditions. "
+                              "minimal27: partial TT/SS/FF coverage, omitting SF/FS. "
+                              "full60: full required five-corner, three-supply, four-temperature grid (slow).")
     parser.add_argument("--trade-off-preference", choices=("most_robust", "lowest_power", "strongest_eye_height",
                                                              "widest_eye", "largest_margin", "balanced"),
                          default="most_robust")
@@ -489,6 +496,8 @@ def _main() -> int:
              "never reaches those stages (simulator/receiver.py::_run_hd3/_run_noise). No effect for "
              "--backend synthetic. Off by default (adds real SPICE time).",
     )
+    parser.add_argument("--search-seconds", type=float, default=120.0)
+    parser.add_argument("--max-evaluations", type=int, default=4)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--export-schematic", type=Path, default=None)
     args = parser.parse_args()
@@ -514,6 +523,7 @@ def _main() -> int:
         trade_off_preference=args.trade_off_preference,
         measure_hd3_noise_flag=args.measure_hd3_noise,
         export_schematic_to=args.export_schematic,
+        search_limits=SearchLimits(args.search_seconds, args.max_evaluations),
     )
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(json.dumps(result, indent=2), encoding="utf-8")

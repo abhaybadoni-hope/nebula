@@ -82,6 +82,9 @@ def ac_metrics(trace: Trace) -> dict[str, object]:
         "gain_2p5ghz_db": _at(frequency, gain_db, 2.5e9),
         "gain_5ghz_db": _at(frequency, gain_db, 5e9),
     }
+    # Boost is relative to 100 MHz, matching the existing peaking convention.
+    metrics["nyquist_frequency_hz"] = 2.5e9
+    metrics["nyquist_boost_db"] = metrics["gain_2p5ghz_db"] - metrics["gain_100mhz_db"]
     intended = (frequency >= 1.25e9) & (frequency <= 2.5e9)
     if not numpy.any(intended):
         raise ValueError("AC trace does not cover the intended peaking band")

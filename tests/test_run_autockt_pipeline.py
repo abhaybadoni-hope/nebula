@@ -96,14 +96,14 @@ class GenerateCandidatesTests(unittest.TestCase):
             agent_seed=1, eval_seed=1, episodes=10, horizon=1, backend="synthetic",
             initial_indices_source="grid-center",
         )
-        feasible = filter_nominal_feasible(candidates)
+        feasible = filter_nominal_feasible(candidates, require_peaking=False)
         self.assertGreater(len(feasible), 0)
 
 
 class FilterNominalFeasibleTests(unittest.TestCase):
     def test_keeps_only_spec_satisfied_candidates(self):
         candidates = [
-            PipelineCandidate(0, {}, {}, 10.0, True, 1),
+            PipelineCandidate(0, {}, {"ctle_power_w": 0.001, "dfe_locked_phase_eye_height_v": 1.0, "dfe_eye_width_ui": 0.5, "dfe_min_margin_v": 0.3, "peaking_db": 6.0}, 10.0, True, 1),
             PipelineCandidate(1, {}, {}, -1.0, False, 4),
         ]
         feasible = filter_nominal_feasible(candidates)
@@ -122,7 +122,7 @@ class SelectFinalDesignTests(unittest.TestCase):
             PipelineCandidate(0, {"rload_ohm": 1000.0, "rdeg_ohm": 1000.0, "cdeg_f": 5e-13,
                                   "itail_a": 1e-4, "dfe_tap_v": 0.0},
                                {"ctle_power_w": 0.001, "dfe_locked_phase_eye_height_v": 1.0,
-                                "dfe_eye_width_ui": 0.5, "dfe_min_margin_v": 0.3},
+                                "dfe_eye_width_ui": 0.5, "dfe_min_margin_v": 0.3, "peaking_db": 6.0},
                                10.0, True, 1),
         ]
         selection = select_final_design(candidates)
@@ -171,11 +171,11 @@ class SelectFinalDesignTests(unittest.TestCase):
             PipelineCandidate(0, {"rload_ohm": 1000.0, "rdeg_ohm": 1000.0, "cdeg_f": 5e-13,
                                   "itail_a": 1e-4, "dfe_tap_v": 0.0},
                                {"ctle_power_w": 0.01, "dfe_locked_phase_eye_height_v": 1.0,
-                                "dfe_eye_width_ui": 0.5, "dfe_min_margin_v": 0.3}, 10.0, True, 1),
+                                "dfe_eye_width_ui": 0.5, "dfe_min_margin_v": 0.3, "peaking_db": 6.0}, 10.0, True, 1),
             PipelineCandidate(1, {"rload_ohm": 2000.0, "rdeg_ohm": 1000.0, "cdeg_f": 5e-13,
                                   "itail_a": 1e-4, "dfe_tap_v": 0.0},
                                {"ctle_power_w": 0.001, "dfe_locked_phase_eye_height_v": 1.0,
-                                "dfe_eye_width_ui": 0.5, "dfe_min_margin_v": 0.3}, 10.0, True, 1),
+                                "dfe_eye_width_ui": 0.5, "dfe_min_margin_v": 0.3, "peaking_db": 6.0}, 10.0, True, 1),
         ]
         conditions = (SimulationConditions(ProcessCorner.TT, 27.0, 1.8),)
 
@@ -252,9 +252,9 @@ class PvtResultFlowsIntoFinalSpecificationTests(unittest.TestCase):
 
         self.assertIsNotNone(result["selection"]["selected"])
         pvt_row = next(r for r in result["final_specification"]["rows"] if r["metric"] == "PVT (pass/total)")
-        # must reflect the real 2-condition sweep, not "NOT CLAIMED".
+        # Preserve the 2-condition result without claiming full required coverage.
         self.assertEqual(pvt_row["measured"], "2/2")
-        self.assertEqual(pvt_row["verdict"], "PASS")
+        self.assertEqual(pvt_row["verdict"], "NOT CLAIMED")
 
 
 class MeasureHd3AndNoiseTests(unittest.TestCase):
@@ -305,7 +305,7 @@ class RunPipelineHd3NoiseRefinementTests(unittest.TestCase):
         return [PipelineCandidate(
             0, {"rload_ohm": 1000.0, "rdeg_ohm": 1000.0, "cdeg_f": 5e-13, "itail_a": 1e-4, "dfe_tap_v": 0.0},
             {"ctle_power_w": 0.001, "dfe_locked_phase_eye_height_v": 1.0, "dfe_eye_width_ui": 0.5,
-             "dfe_min_margin_v": 0.3}, 10.0, True, 1,
+             "dfe_min_margin_v": 0.3, "peaking_db": 6.0}, 10.0, True, 1,
         )]
 
     def test_refinement_merges_hd3_noise_into_the_final_specification(self):
@@ -313,7 +313,7 @@ class RunPipelineHd3NoiseRefinementTests(unittest.TestCase):
 
         def fake_evaluate_receiver(parameters, conditions, fidelity):
             return ReceiverEvaluation(True, parameters, conditions, fidelity, (),
-                                       {"hd3_db": -40.0, "input_referred_noise_vrms": 0.0005},
+                                       {**self._feasible_candidates()[0].metrics, "hd3_db": -40.0, "input_referred_noise_vrms": 0.0005},
                                        None, 90.0, "id", {})
 
         with patch("experiments.run_autockt_pipeline.generate_candidates", return_value=self._feasible_candidates()):

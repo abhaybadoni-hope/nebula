@@ -7,6 +7,7 @@ from enum import IntEnum
 import math
 from pathlib import Path
 import tempfile
+import time
 from typing import Iterable, Mapping
 
 from .channel import (
@@ -68,6 +69,7 @@ class ReceiverParameters:
 
     def spice_parameters(self, conditions: SimulationConditions) -> dict[str, float]:
         return {
+            **(conditions.circuit_sizing.spice_parameters() if conditions.circuit_sizing else {}),
             "RLOAD": self.rload_ohm,
             "RDEG": self.rdeg_ohm,
             "CDEG": self.cdeg_f,
@@ -139,11 +141,18 @@ class ReceiverEvaluation:
         )
 
 
+def circuit_block(conditions: SimulationConditions) -> Path:
+    if conditions.circuit_sizing is None:
+        return BLOCK
+    name = "ctle_physical_bias.spice" if conditions.circuit_sizing.physical_bias else "ctle_sized.spice"
+    return BLOCK.with_name(name)
+
+
 def _templates(model: Path, conditions: SimulationConditions) -> dict[str, str]:
     return {
         "SKY130_MODEL_LIBRARY": model.as_posix(),
         "PROCESS_CORNER": conditions.process_corner.value,
-        "CTLE_BLOCK_FILE": BLOCK.as_posix(),
+        "CTLE_BLOCK_FILE": circuit_block(conditions).as_posix(),
         "TEMPERATURE_C": format(conditions.temperature_c, ".15g"),
     }
 
@@ -189,7 +198,7 @@ def _dc_metrics(measurements: Mapping[str, float], parameters: ReceiverParameter
         violations.append("an input transistor has non-positive VDS")
     if abs(metrics["output_offset_v"]) > 0.05:
         violations.append("DC differential output offset exceeds 50 mV")
-    if abs(metrics["branch_current_sum_a"] - parameters.itail_a) > max(parameters.itail_a * 0.1, 1e-9):
+    if not (conditions.circuit_sizing and conditions.circuit_sizing.physical_bias) and abs(metrics["branch_current_sum_a"] - parameters.itail_a) > max(parameters.itail_a * 0.1, 1e-9):
         violations.append("load branch currents do not match tail current within 10 percent")
     if metrics["ctle_power_w"] <= 0 or metrics["ctle_power_w"] >= 15e-3:
         violations.append("Stage 1 CTLE power is outside (0, 15 mW)")
@@ -309,16 +318,19 @@ def _run_hd3(parameters, conditions, model, ngspice, characterize: bool = False)
 def _transient_config(fidelity: EvaluationFidelity, conditions: SimulationConditions) -> NRZStimulusConfig:
     counts = {
         EvaluationFidelity.SCREENING: 32,
-        EvaluationFidelity.TRAINING: 128,
+        EvaluationFidelity.TRAINING: conditions.training_bit_count,
         EvaluationFidelity.CANDIDATE: 512,
         EvaluationFidelity.FINAL: 1024,
     }
     count = counts[fidelity]
-    warmup = 4 if count == 32 else (16 if count == 128 else 32)
+    if fidelity >= EvaluationFidelity.CANDIDATE and conditions.validation_bit_count is not None:
+        count = conditions.validation_bit_count
+    warmup = 4 if count == 32 else (16 if count <= 128 else 32)
     tail = warmup
     return NRZStimulusConfig(
         common_mode_v=conditions.input_common_mode_v, bit_count=count,
-        warmup_bits=warmup, tail_bits=tail,
+        warmup_bits=warmup, tail_bits=tail, pattern=conditions.stimulus_pattern,
+        jitter_rms_s=conditions.stimulus_jitter_rms_s,
     )
 
 
@@ -333,6 +345,7 @@ def _write_stimulus_include(path: Path, stimulus, waveform, conditions: Simulati
         stimulus_include(
             stimulus.time_s, waveform, conditions.input_common_mode_v,
             _source_division_compensation(conditions),
+            tolerance_v=conditions.stimulus_pwl_tolerance_v,
         ),
         encoding="utf-8",
     )
@@ -400,7 +413,7 @@ def _run_channel_diagnostics(channel_path: str | Path,
 
 
 def _run_transient(parameters, conditions, model, ngspice, fidelity, channel_path,
-                   port_map: ChannelPortMap = ChannelPortMap()) -> StageResult:
+                   port_map: ChannelPortMap = ChannelPortMap(), *, waveform_output=None) -> StageResult:
     numpy = require_numpy()
     stimulus = generate_nrz(_transient_config(fidelity, conditions))
     channel = load_s4p(channel_path, port_map=port_map)
@@ -430,6 +443,11 @@ def _run_transient(parameters, conditions, model, ngspice, fidelity, channel_pat
     try:
         trace = parse_wrdata(result.artifacts["WAVEFORM_OUTPUT_FILE"])
         vout = trace.column("vout_diff")
+        if waveform_output is not None:
+            numpy.savez_compressed(waveform_output,time_s=trace.scale,vout_diff=vout,
+                bits=stimulus.bits,ui_s=stimulus.config.ui_s,
+                warmup_bits=stimulus.config.warmup_bits,tail_bits=stimulus.config.tail_bits,
+                bulk_delay_s=max(channel.bulk_delay_s(),0.0))
         outp = trace.column("v(outp)")
         outn = trace.column("v(outn)")
         supply_current = trace.column("supply_current")
@@ -550,6 +568,7 @@ def evaluate_receiver(
     sky130: Sky130Config | None = None,
     ngspice: NgSpiceConfig | None = None,
     cache: EvaluationCache | None = None,
+    deadline: float | None = None,
 ) -> ReceiverEvaluation:
     started_stages: list[StageResult] = []
     effective_ngspice = ngspice or NgSpiceConfig(
@@ -594,7 +613,7 @@ def evaluate_receiver(
             "model_library_checksum": spice_dependency_fingerprint(model),
             "model_library_root_checksum": sha256_file(model),
             "model_dependency_count": len(spice_dependency_manifest(model)),
-            "ctle_block_checksum": sha256_file(BLOCK),
+            "ctle_block_checksum": sha256_file(circuit_block(conditions)),
             "bench_checksum": stable_fingerprint({
                 path.name: sha256_file(path) for path in sorted(BENCHES.glob("*.cir"))
             }),
@@ -645,6 +664,15 @@ def evaluate_receiver(
     combined: dict[str, float] = {}
     failed_stage: str | None = None
     for runner in runners:
+        if deadline is not None:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                started_stages.append(StageResult("budget", False, 0.0,
+                    failure_code=FailureCode.NGSPICE_TIMEOUT.value,
+                    errors=("search time budget reached",), retryable=True))
+                failed_stage = "budget"
+                break
+            effective_ngspice = replace(effective_ngspice, timeout_s=min(effective_ngspice.timeout_s, remaining))
         try:
             stage = runner()
         except Exception as exc:

@@ -72,7 +72,7 @@ class ValidateRequestTests(unittest.TestCase):
         self.assertTrue(any("episodes" in p for p in problems))
 
     def test_bad_pvt_condition_set_is_rejected(self):
-        problems = web_ui._validate_request(self._base(pvt_condition_set="full60"))
+        problems = web_ui._validate_request(self._base(pvt_condition_set="invalid-grid"))
         self.assertTrue(any("pvt_condition_set" in p for p in problems))
 
 

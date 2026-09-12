@@ -15,6 +15,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
+from analysis.acceptance import gate as _gate
+from simulator.config import PVT_GRID
 from analysis.area_estimate import estimate_ctle_area
 from analysis.pvt_selection import PVTRobustnessResult, load_pvt_results_from_jsonl
 
@@ -26,16 +28,6 @@ class SpecRow:
     requirement: str
     verdict: str  # "PASS", "FAIL", or "NOT CLAIMED"
     source: str
-
-
-def _gate(value: Optional[float], *, minimum: Optional[float] = None, maximum: Optional[float] = None) -> str:
-    if value is None:
-        return "NOT CLAIMED"
-    if minimum is not None and value < minimum:
-        return "FAIL"
-    if maximum is not None and value > maximum:
-        return "FAIL"
-    return "PASS"
 
 
 def build_final_specification_report(
@@ -66,9 +58,7 @@ def build_final_specification_report(
         SpecRow(
             "Eye height (V)",
             f"{metric('dfe_locked_phase_eye_height_v'):.4g}" if metric("dfe_locked_phase_eye_height_v") is not None else None,
-            "> 0.1 V (this repo's own EXISTING_THRESHOLDS value -- the official "
-            "slide's exact mV figure was not independently re-verified against "
-            "this number in this pass; see docs/autockt-mapping.md sec 21)",
+            "> 0.1 V (100 mV)",
             _gate(metric("dfe_locked_phase_eye_height_v"), minimum=0.1), nominal_source,
         ),
         SpecRow(
@@ -77,12 +67,12 @@ def build_final_specification_report(
         ),
         SpecRow(
             "Power (W)", f"{metric('ctle_power_w'):.4g}" if metric("ctle_power_w") is not None else None,
-            "< 0.015 W (15 mW)", _gate(metric("ctle_power_w"), maximum=0.015), nominal_source,
+            "< 0.015 W (15 mW)", _gate(metric("ctle_power_w"), minimum=0.0, maximum=0.015), nominal_source,
         ),
         SpecRow(
             "Peaking (dB)", f"{metric('peaking_db'):.4g}" if metric("peaking_db") is not None else None,
-            "3-12 dB, ~1.25-2.5 GHz",
-            _gate(metric("peaking_db"), minimum=3.0, maximum=12.0), nominal_source,
+            "3-12 dB (frequency tunability requires separate validation)",
+            _gate(metric("peaking_db"), minimum=3.0, maximum=12.0, inclusive=True), nominal_source,
         ),
         SpecRow(
             "HD3 (dB)", f"{metric('hd3_db'):.4g}" if metric("hd3_db") is not None else None,
@@ -92,7 +82,7 @@ def build_final_specification_report(
             "Input-referred noise (Vrms)",
             f"{metric('input_referred_noise_vrms'):.4g}" if metric("input_referred_noise_vrms") is not None else None,
             "< 0.0015 Vrms (1.5 mV)",
-            _gate(metric("input_referred_noise_vrms"), maximum=0.0015), nominal_source,
+            _gate(metric("input_referred_noise_vrms"), minimum=0.0, maximum=0.0015), nominal_source,
         ),
         SpecRow(
             "Transistor channel area (mm^2)",
@@ -108,15 +98,24 @@ def build_final_specification_report(
         worst_case = [
             f"{p.process_corner}/{p.supply_v}V/{p.temperature_c}C" for p in pvt_result.worst_case_conditions
         ]
-        pvt_verdict = "PASS" if pvt_result.pass_rate >= 1.0 else "PARTIAL"
+        required = {(c.process_corner.value, c.supply_v, c.temperature_c) for c in PVT_GRID}
+        observed = {(p.process_corner, p.supply_v, p.temperature_c) for p in pvt_result.points}
+        complete = required <= observed
+        all_pass = bool(pvt_result.points) and all(p.success for p in pvt_result.points)
+        pvt_verdict = "FAIL" if pvt_result.n_passing < pvt_result.n_conditions else (
+            "PASS" if complete and all_pass else "NOT CLAIMED")
+        coverage = "full required 60-condition grid" if complete else (
+            "nominal-only" if len(observed) == 1 else "smoke" if 1 < len(observed) <= 2 else "partial coverage")
+        missing_corners = sorted({c.process_corner.value for c in PVT_GRID} - {p.process_corner for p in pvt_result.points})
         rows.append(SpecRow(
             "PVT (pass/total)", f"{pvt_result.n_passing}/{pvt_result.n_conditions}",
-            "TT/SS/FF x VDD+/-5% x 0-125C", pvt_verdict,
-            f"{pvt_result.n_conditions}-point sweep, design_id={pvt_result.design_id}"
+            "TT/SS/FF/SF/FS x 1.71/1.80/1.89 V x 0/27/75/125 C", pvt_verdict,
+            f"{pvt_result.n_conditions}-point sweep, design_id={pvt_result.design_id}; {coverage}; "
+            f"{len(required - observed)} required conditions missing; missing corners: {missing_corners}"
             + (f", worst case: {', '.join(worst_case)}" if worst_case else ""),
         ))
     else:
-        rows.append(SpecRow("PVT (pass/total)", None, "TT/SS/FF x VDD+/-5% x 0-125C", "NOT CLAIMED", "no PVT result supplied"))
+        rows.append(SpecRow("PVT (pass/total)", None, "TT/SS/FF/SF/FS x 1.71/1.80/1.89 V x 0/27/75/125 C", "NOT CLAIMED", "no PVT result supplied"))
 
     return {
         "design_id": design_id,

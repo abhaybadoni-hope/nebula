@@ -54,6 +54,9 @@ class NgSpiceConfig:
                 return path.resolve()
             raise FileNotFoundError(f"NGSpice executable does not exist: {path}")
 
+        local = Path(__file__).resolve().parents[1] / "generated/tools/ngspice/Library/bin/ngspice_con.exe"
+        if local.is_file():
+            return local.resolve()
         for name in ("ngspice_con.exe", "ngspice.exe", "ngspice"):
             found = shutil.which(name)
             if found:
@@ -145,6 +148,17 @@ def parameterize_netlist(source: str, parameters: Mapping[str, ParameterValue]) 
     return rendered
 
 
+def spice_path(path: str | Path) -> str:
+    """Use an existing Windows short path for ngspice versions with .lib space bugs."""
+    path = Path(path).resolve()
+    if os.name == "nt" and " " in str(path) and path.exists():
+        import ctypes
+        buffer = ctypes.create_unicode_buffer(32768)
+        if ctypes.windll.kernel32.GetShortPathNameW(str(path), buffer, len(buffer)):
+            return Path(buffer.value).as_posix()
+    return path.as_posix()
+
+
 def render_template(source: str, values: Mapping[str, str]) -> str:
     """Replace explicit ``@@NAME@@`` placeholders in a netlist."""
 
@@ -156,6 +170,8 @@ def render_template(source: str, values: Mapping[str, str]) -> str:
             raise ValueError(f"Template value {name!r} must be a non-empty string")
         if any(character in value for character in ('\n', '\r', '"')):
             raise ValueError(f"Template value {name!r} contains unsafe characters")
+        if Path(value).is_absolute() and Path(value).exists():
+            value = spice_path(value)
         marker = f"@@{name}@@"
         if marker not in rendered:
             raise KeyError(f"Template marker {marker!r} is not declared in the netlist")

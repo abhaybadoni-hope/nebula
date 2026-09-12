@@ -1,0 +1,9 @@
+{
+  "scope": "four local perturbations, nominal synthetic channel; no policy-quality claim",
+  "serial_128_s": 24.691603200044483,
+  "parallel_128_s": 14.768347500008531,
+  "parallel_speedup": 1.671927289091093,
+  "parallel_metrics_identical": true,
+  "max_short_waveform_eye_height_relative_change": 0.08978836322225187,
+  "decision": "Enable two-worker sizing training; keep default 128-bit measurements."
+}

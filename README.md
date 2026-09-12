@@ -6,8 +6,12 @@ RL-independent Python-to-ngspice evaluation pipeline.
 
 The current optimization scope is the Stage 1 schematic model: a reusable
 one-stage CTLE, a file-driven differential channel, and a behavioral one-tap
-DFE. MOS dimensions and the physical DFE implementation are deliberately left
-for Stage 2.
+DFE. The optional grouped-sizing policy now also searches MOS dimensions and a
+transistor bias mirror. The transistor sampler/DFE remains experimental and
+has not passed its bit-error validation.
+
+See [fast design and validation](docs/fast-design.md) for runtime budgets,
+new training/inference commands, exports, and measured limitations.
 
 ```text
 parameters -> DC -> AC -> 32-bit CTLE diagnostic -> channel validation

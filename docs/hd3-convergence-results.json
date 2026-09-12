@@ -1,0 +1,66 @@
+{
+  "scope": "legacy CTLE; fixed TT-selected parameters at nominal voltage/temperature",
+  "parameters": {
+    "rload_ohm": 2342.472156058411,
+    "rdeg_ohm": 1233.5337940389904,
+    "cdeg_f": 9.999375862792168e-13,
+    "itail_a": 0.0006028331705063624,
+    "dfe_tap_v": -0.011090823885148815
+  },
+  "checks": [
+    {
+      "corner": "tt",
+      "differential_pp_v": 0.1,
+      "complete": true,
+      "worst_hd3_db": -82.66714529857379,
+      "spread_db": 0.0028130630082472408,
+      "stable_within_0p1_db": true,
+      "passes_hd3": true
+    },
+    {
+      "corner": "tt",
+      "differential_pp_v": 0.2,
+      "complete": true,
+      "worst_hd3_db": -70.54443177708204,
+      "spread_db": 0.0006985517412658737,
+      "stable_within_0p1_db": true,
+      "passes_hd3": true
+    },
+    {
+      "corner": "ss",
+      "differential_pp_v": 0.1,
+      "complete": true,
+      "worst_hd3_db": -82.33463873866401,
+      "spread_db": 0.0027562293398801785,
+      "stable_within_0p1_db": true,
+      "passes_hd3": true
+    },
+    {
+      "corner": "ss",
+      "differential_pp_v": 0.2,
+      "complete": true,
+      "worst_hd3_db": -70.22389124841285,
+      "spread_db": 0.0006786796657962668,
+      "stable_within_0p1_db": true,
+      "passes_hd3": true
+    },
+    {
+      "corner": "ff",
+      "differential_pp_v": 0.1,
+      "complete": true,
+      "worst_hd3_db": -83.67961238193183,
+      "spread_db": 0.0029627150440063588,
+      "stable_within_0p1_db": true,
+      "passes_hd3": true
+    },
+    {
+      "corner": "ff",
+      "differential_pp_v": 0.2,
+      "complete": true,
+      "worst_hd3_db": -71.52111038724242,
+      "spread_db": 0.0007468285617733272,
+      "stable_within_0p1_db": true,
+      "passes_hd3": true
+    }
+  ]
+}

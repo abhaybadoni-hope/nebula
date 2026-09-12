@@ -1,0 +1,21 @@
+* Reusable one-stage SKY130 CTLE with source degeneration
+.subckt CTLE inp inn outp outn vdd vss
++ params: RLOAD=1k RDEG=1k CDEG=0.5p ITAIL_VAL=100u WIN=10 LIN=0.15 WTAIL=20 LTAIL=0.5 RBIAS=11500
+
+RDP vdd outp {RLOAD}
+RDN vdd outn {RLOAD}
+
+XMP outp inp srcp vss sky130_fd_pr__nfet_01v8 W={WIN} L={LIN}
+XMN outn inn srcn vss sky130_fd_pr__nfet_01v8 W={WIN} L={LIN}
+
+RS1 srcp tail {RDEG}
+RS2 srcn tail {RDEG}
+CD1 srcp tail {CDEG}
+CD2 srcn tail {CDEG}
+
+* Resistor-fed diode-connected reference and matched tail mirror.
+* ITAIL_VAL is only the legacy target; actual current is measured.
+RBIAS_REF vdd vbias {RBIAS}
+XREF vbias vbias vss vss sky130_fd_pr__nfet_01v8 W={WTAIL} L={LTAIL}
+XTAIL tail vbias vss vss sky130_fd_pr__nfet_01v8 W={WTAIL} L={LTAIL}
+.ends CTLE

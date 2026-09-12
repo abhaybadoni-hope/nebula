@@ -1,0 +1,82 @@
+{
+  "base_parameters": {
+    "rload_ohm": 2342.472156058411,
+    "rdeg_ohm": 1233.5337940389904,
+    "cdeg_f": 9.999375862792168e-13,
+    "itail_a": 0.0006028331705063624,
+    "dfe_tap_v": -0.011090823885148815
+  },
+  "conditions": {
+    "process_corner": "tt",
+    "temperature_c": 27.0,
+    "supply_v": 1.8,
+    "input_common_mode_v": 1.2,
+    "output_load_f": 2e-14,
+    "source_resistance_per_leg_ohm": 50.0,
+    "receiver_termination_diff_ohm": 100.0,
+    "input_parasitic_f": 0.0,
+    "circuit_sizing": null,
+    "stimulus_pattern": "prbs7",
+    "stimulus_jitter_rms_s": 0.0,
+    "stimulus_pwl_tolerance_v": 0.0,
+    "training_bit_count": 128,
+    "validation_bit_count": null
+  },
+  "noise": [
+    {
+      "corner": "tt",
+      "noise_vrms": 0.0003639569470786737,
+      "passed": true
+    },
+    {
+      "corner": "ss",
+      "noise_vrms": 0.00038649489042843214,
+      "passed": true
+    },
+    {
+      "corner": "ff",
+      "noise_vrms": 0.00034024916126104406,
+      "passed": true
+    }
+  ],
+  "targets": [
+    {
+      "target_hz": 1250000000.0,
+      "measured_peak_hz": 1288249551.693124,
+      "parameters": {
+        "rload_ohm": 1639.7305092408878,
+        "rdeg_ohm": 1233.5337940389904,
+        "cdeg_f": 1.6998938966746685e-12,
+        "itail_a": 0.0006028331705063624,
+        "dfe_tap_v": -0.011090823885148815
+      },
+      "passed_short_checks": true
+    },
+    {
+      "target_hz": 1875000000.0,
+      "measured_peak_hz": 1862087136.662852,
+      "parameters": {
+        "rload_ohm": 1639.7305092408878,
+        "rdeg_ohm": 1233.5337940389904,
+        "cdeg_f": 7.999500690233735e-13,
+        "itail_a": 0.0006028331705063624,
+        "dfe_tap_v": -0.011090823885148815
+      },
+      "passed_short_checks": true
+    },
+    {
+      "target_hz": 2500000000.0,
+      "measured_peak_hz": 2398832919.019469,
+      "parameters": {
+        "rload_ohm": 1639.7305092408878,
+        "rdeg_ohm": 1233.5337940389904,
+        "cdeg_f": 4.749703534826279e-13,
+        "itail_a": 0.0006028331705063624,
+        "dfe_tap_v": -0.011090823885148815
+      },
+      "passed_short_checks": true
+    }
+  ],
+  "tolerance_fraction": 0.05,
+  "continuous_tunability_proven": false
+}
